@@ -630,6 +630,24 @@ static bool is_fast_path(struct kvm *kvm, struct kvm_dsm_memory_slot *slot,
 	return false;
 }
 
+void record_gfn_to_access_history(struct kvm *kvm, gfn_t gfn, int write)
+{
+	mutex_lock(&(kvm->prefetch_access_history_lock));
+	kvm->prefetch_access_history[kvm->prefetch_access_history_head].gfn = gfn;
+	kvm->prefetch_access_history[kvm->prefetch_access_history_head].write = write;
+	kvm->prefetch_access_history_head++;
+	if (kvm->prefetch_access_history_head >= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
+		kvm->prefetch_access_history_head -= KVM_PREFETCH_ACCESS_HISTORY_SIZE;
+	}
+	printk(KERN_DEBUG "*****DUMP ACCESS HISTORY START*****");
+	int prefetch_debug_i;
+	for (prefetch_debug_i = 0; prefetch_debug_i < KVM_PREFETCH_ACCESS_HISTORY_SIZE; prefetch_debug_i++) {
+		printk(KERN_DEBUG "gfn: %llu, write: %d", kvm->prefetch_access_history[prefetch_debug_i].gfn, kvm->prefetch_access_history[prefetch_debug_i].write);
+	}
+	printk(KERN_DEBUG "*****DUMP ACCESS HISTORY STOP*****");
+	mutex_unlock(&(kvm->prefetch_access_history_lock));
+}
+
 /*
  * copyset rules:
  * 1. Only copyset residing on the owner side is valid, so when owner
@@ -673,14 +691,6 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 
 	BUG_ON(dsm_is_initial(slot, vfn) && dsm_get_prob_owner(slot, vfn) != 0);
 
-	mutex_lock(&(kvm->prefetch_access_history_lock));
-	kvm->prefetch_access_history[kvm->prefetch_access_history_head] = gfn;
-	kvm->prefetch_access_history_head++;
-	if (kvm->prefetch_access_history_head >= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
-		kvm->prefetch_access_history_head -= KVM_PREFETCH_ACCESS_HISTORY_SIZE;
-	}
-	mutex_unlock(&(kvm->prefetch_access_history_lock));
-
 	page = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (page == NULL) {
 		ret = -ENOMEM;
@@ -722,6 +732,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 				ret = ACC_ALL;
 				goto out;
 			}
+			record_gfn_to_access_history(kvm, gfn, 1);
 			/*
 			 * Ask the probOwner. The prob(ably) owner is probably true owner,
 			 * or not. If not, forward the request to next probOwner until find
@@ -780,6 +791,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			ret = ACC_EXEC_MASK | ACC_USER_MASK;
 			goto out;
 		}
+		record_gfn_to_access_history(kvm, gfn, 0);
 		/* Ask the probOwner */
 		ret = resp_len = kvm_dsm_fetch(kvm, owner, false, &req, page, &resp);
 		if (ret < 0)

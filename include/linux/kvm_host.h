@@ -380,6 +380,11 @@ struct kvm_memslots {
 
 #define KVM_PREFETCH_ACCESS_HISTORY_SIZE 8
 
+struct kvm_prefetch_access_history_t {
+	gfn_t gfn;
+	int write;
+};
+
 struct kvm {
 	spinlock_t mmu_lock;
 	struct mutex slots_lock;
@@ -441,7 +446,7 @@ struct kvm {
 	struct kvm_stat_data **debugfs_stat_data;
 
 	struct mutex prefetch_access_history_lock;
-	gfn_t prefetch_access_history[KVM_PREFETCH_ACCESS_HISTORY_SIZE];
+	struct kvm_prefetch_access_history_t prefetch_access_history[KVM_PREFETCH_ACCESS_HISTORY_SIZE];
 	short prefetch_access_history_head;
 };
 
