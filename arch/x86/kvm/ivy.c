@@ -673,6 +673,14 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 
 	BUG_ON(dsm_is_initial(slot, vfn) && dsm_get_prob_owner(slot, vfn) != 0);
 
+	mutex_lock(&(kvm->prefetch_access_history_lock));
+	kvm->prefetch_access_history[kvm->prefetch_access_history_head] = gfn;
+	kvm->prefetch_access_history_head++;
+	if (kvm->prefetch_access_history_head >= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
+		kvm->prefetch_access_history_head -= KVM_PREFETCH_ACCESS_HISTORY_SIZE;
+	}
+	mutex_unlock(&(kvm->prefetch_access_history_lock));
+
 	page = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (page == NULL) {
 		ret = -ENOMEM;
