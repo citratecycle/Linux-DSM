@@ -379,9 +379,10 @@ struct kvm_memslots {
 };
 
 #define KVM_PREFETCH_ACCESS_HISTORY_SIZE 8
+#define KVM_PREFETCH_TREND_WINDOW_SPLIT 2
 
 struct kvm_prefetch_access_history_t {
-	gfn_t gfn;
+	long long gfn_delta;
 	int write;
 };
 
@@ -446,6 +447,7 @@ struct kvm {
 	struct kvm_stat_data **debugfs_stat_data;
 
 	struct mutex prefetch_access_history_lock;
+	gfn_t prefetch_last_gfn;
 	struct kvm_prefetch_access_history_t prefetch_access_history[KVM_PREFETCH_ACCESS_HISTORY_SIZE];
 	short prefetch_access_history_head;
 };

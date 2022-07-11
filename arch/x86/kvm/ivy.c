@@ -632,20 +632,64 @@ static bool is_fast_path(struct kvm *kvm, struct kvm_dsm_memory_slot *slot,
 
 void record_gfn_to_access_history(struct kvm *kvm, gfn_t gfn, int write)
 {
-	mutex_lock(&(kvm->prefetch_access_history_lock));
-	kvm->prefetch_access_history[kvm->prefetch_access_history_head].gfn = gfn;
+	mutex_lock(&kvm->prefetch_access_history_lock);
+	kvm->prefetch_access_history[kvm->prefetch_access_history_head].gfn_delta = gfn - kvm->prefetch_last_gfn;
 	kvm->prefetch_access_history[kvm->prefetch_access_history_head].write = write;
+	kvm->prefetch_last_gfn = gfn;
 	kvm->prefetch_access_history_head++;
 	if (kvm->prefetch_access_history_head >= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
 		kvm->prefetch_access_history_head -= KVM_PREFETCH_ACCESS_HISTORY_SIZE;
 	}
-	printk(KERN_DEBUG "*****DUMP ACCESS HISTORY START*****");
-	int prefetch_debug_i;
-	for (prefetch_debug_i = 0; prefetch_debug_i < KVM_PREFETCH_ACCESS_HISTORY_SIZE; prefetch_debug_i++) {
-		printk(KERN_DEBUG "gfn: %llu, write: %d", kvm->prefetch_access_history[prefetch_debug_i].gfn, kvm->prefetch_access_history[prefetch_debug_i].write);
+	mutex_unlock(&kvm->prefetch_access_history_lock);
+}
+
+long long find_trend(struct kvm *kvm)
+{
+	int w = KVM_PREFETCH_ACCESS_HISTORY_SIZE / KVM_PREFETCH_TREND_WINDOW_SPLIT;
+	long long majority = 0;
+	int iterator, count, index;
+
+	mutex_lock(&kvm->prefetch_access_history_lock);
+	while(w <= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
+		// Boyer–Moore majority vote algorithm
+		count = 0;
+		for(iterator = 1; iterator <= w; iterator++) {
+			index = kvm->prefetch_access_history_head - iterator;
+			if(index < 0) {
+				index += KVM_PREFETCH_ACCESS_HISTORY_SIZE;
+			}
+			if(count == 0) {
+				majority = kvm->prefetch_access_history[index].gfn_delta;
+			} else if (majority == kvm->prefetch_access_history[index].gfn_delta) {
+				count++;
+			} else {
+				count--;
+			}
+		}
+		// Check whether the majority is a real majority
+		count = 0;
+		for(iterator = 1; iterator <= w; iterator++) {
+			index = kvm->prefetch_access_history_head - iterator;
+			if(index < 0) {
+				index += KVM_PREFETCH_ACCESS_HISTORY_SIZE;
+			}
+			if(majority == kvm->prefetch_access_history[index].gfn_delta) {
+				count++;
+			}
+		}
+		if(count < w / 2 + 1) {
+			majority = 0;
+		}
+		// Increase window size
+		w *= 2;
+		// Return majority
+		if(majority != 0) {
+			mutex_unlock(&kvm->prefetch_access_history_lock);
+			return majority;
+		}
 	}
-	printk(KERN_DEBUG "*****DUMP ACCESS HISTORY STOP*****");
-	mutex_unlock(&(kvm->prefetch_access_history_lock));
+	mutex_unlock(&kvm->prefetch_access_history_lock);
+	return majority;
 }
 
 /*
@@ -733,6 +777,8 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 				goto out;
 			}
 			record_gfn_to_access_history(kvm, gfn, 1);
+			printk(KERN_DEBUG "******TREND*****");
+			printk(KERN_DEBUG "dsm_id: %d, trend: %lld", kvm->arch.dsm_id, find_trend(kvm));
 			/*
 			 * Ask the probOwner. The prob(ably) owner is probably true owner,
 			 * or not. If not, forward the request to next probOwner until find
@@ -792,6 +838,8 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			goto out;
 		}
 		record_gfn_to_access_history(kvm, gfn, 0);
+		printk(KERN_DEBUG "******TREND*****");
+		printk(KERN_DEBUG "dsm_id: %d, trend: %lld", kvm->arch.dsm_id, find_trend(kvm));
 		/* Ask the probOwner */
 		ret = resp_len = kvm_dsm_fetch(kvm, owner, false, &req, page, &resp);
 		if (ret < 0)
