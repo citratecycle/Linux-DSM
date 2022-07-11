@@ -380,6 +380,7 @@ struct kvm_memslots {
 
 #define KVM_PREFETCH_ACCESS_HISTORY_SIZE 8
 #define KVM_PREFETCH_TREND_WINDOW_SPLIT 2
+#define KVM_PREFETCH_MAX_WINDOW_SIZE 8
 
 struct kvm_prefetch_access_history_t {
 	long long gfn_delta;
@@ -450,8 +451,14 @@ struct kvm {
 	gfn_t prefetch_last_gfn;
 	struct kvm_prefetch_access_history_t prefetch_access_history[KVM_PREFETCH_ACCESS_HISTORY_SIZE];
 	short prefetch_access_history_head;
-	int prefetch_trend_stat_total;
-	int prefetch_trend_stat_find_majority;
+	int prefetch_last_trend;
+	int prefetch_last_window_size;
+	int prefetch_cache_hits;
+	gfn_t prefetch_cache_demo[KVM_PREFETCH_MAX_WINDOW_SIZE];
+
+	int prefetch_stat_total;
+	int prefetch_stat_prefetched_pages;
+	int prefetch_stat_cache_hits;
 };
 
 #define kvm_err(fmt, ...) \

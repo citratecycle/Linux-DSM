@@ -692,6 +692,90 @@ long long find_trend(struct kvm *kvm)
 	return majority;
 }
 
+int get_prefetch_window_size(struct kvm *kvm, gfn_t gfn)
+{
+	int window_size, temp;
+	if(kvm->prefetch_cache_hits == 0) {
+		temp = kvm->prefetch_access_history_head - 1;
+		temp = temp < 0 ? temp + KVM_PREFETCH_ACCESS_HISTORY_SIZE : temp;
+		if(kvm->prefetch_access_history[temp].gfn_delta == kvm->prefetch_last_trend) {
+			window_size = 1;
+		} else {
+			window_size = 0;
+		}
+	} else {
+		if(KVM_PREFETCH_MAX_WINDOW_SIZE <= 16) {
+			switch(kvm->prefetch_cache_hits + 1) {
+				case 2: window_size = 2; break;
+				case 3:
+				case 4:
+				case 5:
+				case 6:
+				case 7:
+				case 8: window_size = 8; break;
+				case 9:
+				case 10:
+				case 11:
+				case 12:
+				case 13:
+				case 14:
+				case 15:
+				case 16: window_size = 16; break;
+			}
+		} else {
+			temp = 0;
+			while(kvm->prefetch_cache_hits != 0) {
+				kvm->prefetch_cache_hits /= 2;
+				temp++;
+			}
+			window_size = 2;
+			while(temp > 1) {
+				window_size *= 2;
+				temp--;
+			}
+		}
+	}
+	window_size = window_size < KVM_PREFETCH_MAX_WINDOW_SIZE ? window_size : KVM_PREFETCH_MAX_WINDOW_SIZE;
+	if(window_size < kvm->prefetch_last_window_size / 2) {
+		window_size = kvm->prefetch_last_window_size / 2;
+	}
+	kvm->prefetch_cache_hits = 0;
+	kvm->prefetch_last_window_size = window_size;
+	kvm->prefetch_stat_prefetched_pages += window_size == 0 ? 0 : window_size - 1;
+	return window_size;
+}
+
+void do_prefetch_demo(struct kvm *kvm, gfn_t gfn)
+{
+	int temp;
+	int window_size = get_prefetch_window_size(kvm, gfn);
+	int majority = find_trend(kvm);
+	if(window_size != 0) {
+		if(majority != 0) {
+			for(temp = 0; temp < window_size; temp++) {
+				kvm->prefetch_cache_demo[temp] = gfn + temp * majority;
+			}
+		} else {
+			for(temp = 0; temp < window_size; temp++) {
+				kvm->prefetch_cache_demo[temp] = gfn + temp * kvm->prefetch_last_trend;
+			}
+		}
+	}
+	kvm->prefetch_last_trend = majority;
+}
+
+int cache_demo(struct kvm *kvm, gfn_t gfn) {
+	int i;
+	for(i = 0; i < kvm->prefetch_last_window_size; i++) {
+		if(gfn == kvm->prefetch_cache_demo[i]) {
+			kvm->prefetch_cache_hits++;
+			kvm->prefetch_stat_cache_hits++;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 /*
  * copyset rules:
  * 1. Only copyset residing on the owner side is valid, so when owner
@@ -776,11 +860,12 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 				ret = ACC_ALL;
 				goto out;
 			}
+			kvm->prefetch_stat_total++;
 			record_gfn_to_access_history(kvm, gfn, 1);
-			kvm->prefetch_trend_stat_total++;
-			if(find_trend(kvm)) {
-				kvm->prefetch_trend_stat_find_majority++;
-				printk(KERN_DEBUG "dsm_id: %d, trend: %lld, found: %d, total: %d", kvm->arch.dsm_id, find_trend(kvm), kvm->prefetch_trend_stat_find_majority, kvm->prefetch_trend_stat_total);
+			if(cache_demo(kvm, gfn)) {
+				printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
+			} else {
+				do_prefetch_demo(kvm, gfn);
 			}
 			/*
 			 * Ask the probOwner. The prob(ably) owner is probably true owner,
@@ -840,11 +925,12 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			ret = ACC_EXEC_MASK | ACC_USER_MASK;
 			goto out;
 		}
-		record_gfn_to_access_history(kvm, gfn, 0);
-		kvm->prefetch_trend_stat_total++;
-		if(find_trend(kvm)) {
-			kvm->prefetch_trend_stat_find_majority++;
-			printk(KERN_DEBUG "dsm_id: %d, trend: %lld, found: %d, total: %d", kvm->arch.dsm_id, find_trend(kvm), kvm->prefetch_trend_stat_find_majority, kvm->prefetch_trend_stat_total);
+		kvm->prefetch_stat_total++;
+		record_gfn_to_access_history(kvm, gfn, 1);
+		if(cache_demo(kvm, gfn)) {
+			printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
+		} else {
+			do_prefetch_demo(kvm, gfn);
 		}
 		/* Ask the probOwner */
 		ret = resp_len = kvm_dsm_fetch(kvm, owner, false, &req, page, &resp);
