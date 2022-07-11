@@ -450,6 +450,8 @@ struct kvm {
 	gfn_t prefetch_last_gfn;
 	struct kvm_prefetch_access_history_t prefetch_access_history[KVM_PREFETCH_ACCESS_HISTORY_SIZE];
 	short prefetch_access_history_head;
+	int prefetch_trend_stat_total;
+	int prefetch_trend_stat_find_majority;
 };
 
 #define kvm_err(fmt, ...) \

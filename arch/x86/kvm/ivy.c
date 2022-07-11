@@ -777,8 +777,11 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 				goto out;
 			}
 			record_gfn_to_access_history(kvm, gfn, 1);
-			printk(KERN_DEBUG "******TREND*****");
-			printk(KERN_DEBUG "dsm_id: %d, trend: %lld", kvm->arch.dsm_id, find_trend(kvm));
+			kvm->prefetch_trend_stat_total++;
+			if(find_trend(kvm)) {
+				kvm->prefetch_trend_stat_find_majority++;
+				printk(KERN_DEBUG "dsm_id: %d, trend: %lld, found: %d, total: %d", kvm->arch.dsm_id, find_trend(kvm), kvm->prefetch_trend_stat_find_majority, kvm->prefetch_trend_stat_total);
+			}
 			/*
 			 * Ask the probOwner. The prob(ably) owner is probably true owner,
 			 * or not. If not, forward the request to next probOwner until find
@@ -838,8 +841,11 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			goto out;
 		}
 		record_gfn_to_access_history(kvm, gfn, 0);
-		printk(KERN_DEBUG "******TREND*****");
-		printk(KERN_DEBUG "dsm_id: %d, trend: %lld", kvm->arch.dsm_id, find_trend(kvm));
+		kvm->prefetch_trend_stat_total++;
+		if(find_trend(kvm)) {
+			kvm->prefetch_trend_stat_find_majority++;
+			printk(KERN_DEBUG "dsm_id: %d, trend: %lld, found: %d, total: %d", kvm->arch.dsm_id, find_trend(kvm), kvm->prefetch_trend_stat_find_majority, kvm->prefetch_trend_stat_total);
+		}
 		/* Ask the probOwner */
 		ret = resp_len = kvm_dsm_fetch(kvm, owner, false, &req, page, &resp);
 		if (ret < 0)
