@@ -377,7 +377,7 @@ struct kvm_memslots {
 	atomic_t lru_slot;
 	int used_slots;
 };
-
+#if defined(CONFIG_KVM_DSM) && defined(IVY_KVM_DSM)
 #define KVM_PREFETCH_ACCESS_HISTORY_SIZE 8
 #define KVM_PREFETCH_TREND_WINDOW_SPLIT 2
 #define KVM_PREFETCH_MAX_WINDOW_SIZE 8
@@ -386,6 +386,7 @@ struct kvm_prefetch_access_history_t {
 	long long gfn_delta;
 	int write;
 };
+#endif
 
 struct kvm {
 	spinlock_t mmu_lock;
@@ -447,6 +448,7 @@ struct kvm {
 	struct dentry *debugfs_dentry;
 	struct kvm_stat_data **debugfs_stat_data;
 
+#if defined(CONFIG_KVM_DSM) && defined(IVY_KVM_DSM)
 	struct mutex prefetch_access_history_lock;
 	gfn_t prefetch_last_gfn;
 	struct kvm_prefetch_access_history_t prefetch_access_history[KVM_PREFETCH_ACCESS_HISTORY_SIZE];
@@ -459,6 +461,7 @@ struct kvm {
 	int prefetch_stat_total;
 	int prefetch_stat_prefetched_pages;
 	int prefetch_stat_cache_hits;
+#endif
 };
 
 #define kvm_err(fmt, ...) \
