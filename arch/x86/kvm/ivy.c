@@ -61,6 +61,10 @@ struct dsm_request {
 	unsigned char req_type;
 	bool is_smm;
 
+	// For prefetch
+	unsigned char prefetch_size;
+	gfn_t prefetch_gfns[KVM_PREFETCH_MAX_WINDOW_SIZE];
+
 	/*
 	 * If version of two pages in different nodes are the same, the contents
 	 * are the same.
@@ -476,6 +480,9 @@ int ivy_kvm_dsm_handle_req(void *data)
 		BUG_ON(req.requester == kvm->arch.dsm_id);
 
 retry_handle_req:
+		if(req.prefetch_size > 0) {
+			printk(KERN_DEBUG "receiver: kvm_id: %d, prefetch_size: %d", kvm->arch.dsm_id, req.prefetch_size);
+		}
 		idx = srcu_read_lock(&kvm->srcu);
 		memslot = __gfn_to_memslot(__kvm_memslots(kvm, req.is_smm), req.gfn);
 		/*
@@ -741,8 +748,49 @@ int get_prefetch_window_size(struct kvm *kvm, gfn_t gfn)
 	}
 	kvm->prefetch_cache_hits = 0;
 	kvm->prefetch_last_window_size = window_size;
-	kvm->prefetch_stat_prefetched_pages += window_size == 0 ? 0 : window_size - 1;
+	kvm->prefetch_stat_prefetched_pages += window_size;
 	return window_size;
+}
+
+void write_prefetch_to_req(struct kvm *kvm, gfn_t gfn, struct dsm_request *req)
+{
+	int temp;
+	int window_size = get_prefetch_window_size(kvm, gfn);
+	int majority = find_trend(kvm);
+	if (window_size != 0)
+	{
+		if (majority != 0)
+		{
+			req->prefetch_size = window_size;
+			for (temp = 0; temp < window_size; temp++)
+			{
+				req->prefetch_gfns[temp] = gfn + (temp + 1) * majority;
+			}
+		}
+		else
+		{
+			if (kvm->prefetch_last_trend == 0)
+			{
+				req->prefetch_size = 0;
+			}
+			else
+			{
+				req->prefetch_size = window_size;
+				for (temp = 0; temp < window_size; temp++)
+				{
+					req->prefetch_gfns[temp] = gfn + (temp + 1) * kvm->prefetch_last_trend;
+				}
+			}
+		}
+	}
+	else // window_size == 0
+	{
+		req->prefetch_size = 0;
+	}
+	kvm->prefetch_last_trend = majority;
+	if(req->prefetch_size != 0) {
+		printk(KERN_DEBUG "sender: kvm_id: %d, prefetch_size: %d", kvm->arch.dsm_id, req->prefetch_size);
+	}
 }
 
 void do_prefetch_demo(struct kvm *kvm, gfn_t gfn)
@@ -753,11 +801,11 @@ void do_prefetch_demo(struct kvm *kvm, gfn_t gfn)
 	if(window_size != 0) {
 		if(majority != 0) {
 			for(temp = 0; temp < window_size; temp++) {
-				kvm->prefetch_cache_demo[temp] = gfn + temp * majority;
+				kvm->prefetch_cache_demo[temp] = gfn + (temp + 1) * majority;
 			}
 		} else {
 			for(temp = 0; temp < window_size; temp++) {
-				kvm->prefetch_cache_demo[temp] = gfn + temp * kvm->prefetch_last_trend;
+				kvm->prefetch_cache_demo[temp] = gfn + (temp + 1) * kvm->prefetch_last_trend;
 			}
 		}
 	}
@@ -837,6 +885,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			.msg_sender = kvm->arch.dsm_id,
 			.gfn = gfn,
 			.is_smm = is_smm,
+			.prefetch_size = 0,
 			.version = dsm_get_version(slot, vfn),
 		};
 		if (dsm_is_owner(slot, vfn)) {
@@ -866,6 +915,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 				printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
 			} else {
 				do_prefetch_demo(kvm, gfn);
+				write_prefetch_to_req(kvm, gfn, &req);
 			}
 			/*
 			 * Ask the probOwner. The prob(ably) owner is probably true owner,
@@ -908,6 +958,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			.msg_sender = kvm->arch.dsm_id,
 			.gfn = gfn,
 			.is_smm = is_smm,
+			.prefetch_size = 0,
 			.version = dsm_get_version(slot, vfn),
 		};
 		owner = dsm_get_prob_owner(slot, vfn);
