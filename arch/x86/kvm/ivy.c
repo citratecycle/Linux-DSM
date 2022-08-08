@@ -64,6 +64,7 @@ struct dsm_request {
 	// For prefetch
 	unsigned char prefetch_size;
 	gfn_t prefetch_gfns[KVM_PREFETCH_MAX_WINDOW_SIZE];
+	version_t prefetch_versions[KVM_PREFETCH_MAX_WINDOW_SIZE];
 
 	/*
 	 * If version of two pages in different nodes are the same, the contents
@@ -240,6 +241,161 @@ static int dsm_handle_invalidate_req(struct kvm *kvm, kconnection_t *conn_sock,
 	return ret < 0 ? ret : 0;
 }
 
+/*
+ * resp_data will be allocated inside this function, so kfree() is needed after calling this
+*/
+int handle_prefetch_req(struct kvm *kvm, const struct dsm_request *req, char *target_page, int target_length, char **resp_data_ptr)
+{
+	int iterator;
+	struct kvm_memory_slot *memslot;
+	struct kvm_dsm_memory_slot *slot;
+	hfn_t vfn;
+	int ret;
+	int resp_length;
+	int prefetch_count = 0;
+	int temp;
+	struct {
+		gfn_t gfn;         // uint64
+		copyset_t copyset; // uint16
+		version_t version; // uint32
+		int length;
+		char *page;
+	} prefetched_pages[KVM_PREFETCH_MAX_WINDOW_SIZE];
+
+	for (iterator = 0; iterator < KVM_PREFETCH_MAX_WINDOW_SIZE; iterator++) {
+		prefetched_pages[iterator].page = kmalloc(PAGE_SIZE, GFP_KERNEL);
+		if (prefetched_pages[iterator].page == NULL) {
+			for (temp = 0; temp < iterator; temp++) {
+				kfree(prefetched_pages[temp].page);
+			}
+			return -ENOMEM;
+		}
+	}
+
+	for (iterator = 0; iterator < req->prefetch_size; iterator++)
+	{
+		printk(KERN_DEBUG "handle_prefetch_req: prefetching gfn %llu, prefetching version %u", req->prefetch_gfns[iterator], req->prefetch_versions[iterator]);
+		// ivy_kvm_dsm_handle_req, identifying private memslots
+		memslot = __gfn_to_memslot(__kvm_memslots(kvm, req->is_smm), req->prefetch_gfns[iterator]);
+		if (!memslot || memslot->id >= KVM_USER_MEM_SLOTS || memslot->flags & KVM_MEMSLOT_INVALID)
+		{
+			continue;
+		}
+		// ivy_kvm_dsm_handle_req, identifying slot existance
+		vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
+		slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
+		if (!slot)
+		{
+			continue;
+		}
+		// dsm_handle_read_req, identifying pinned gfn
+		if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped)
+		{
+			continue;
+		}
+		// dsm_handle_read_req, identifying ownership of gfn
+		if (!dsm_is_owner(slot, vfn))
+		{
+			continue;
+		}
+		// dsm_handle_read_req, read page
+		BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
+		// dsm_set_prob_owner(slot, vfn, req->msg_sender);
+		// dsm_change_state(slot, vfn, DSM_SHARED);
+		// kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_SHARED);
+		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->prefetch_gfns[iterator], prefetched_pages[prefetch_count].page, 0, PAGE_SIZE);
+		if (ret < 0) {
+			continue;
+		}
+		prefetched_pages[prefetch_count].gfn = req->prefetch_gfns[iterator];
+		prefetched_pages[prefetch_count].copyset = *dsm_get_copyset(slot, vfn);
+		// BUG_ON(!(test_bit(kvm->arch.dsm_id, &prefetched_pages[prefetch_count].copyset)));
+		prefetched_pages[prefetch_count].version = dsm_get_version(slot, vfn);
+		prefetched_pages[prefetch_count].length = dsm_encode_diff(slot, vfn, req->msg_sender,
+		            prefetched_pages[prefetch_count].page, memslot, req->prefetch_gfns[iterator],
+					req->prefetch_versions[iterator]);
+
+		prefetch_count++;
+	}
+
+	// Calculate length of response data
+	resp_length = 1                     // prefetch_count (How many pages are prefetched)
+	              + 2                   // length (Length of target page)
+				  + target_length       // Data of target page
+				  + 8 * prefetch_count  // gfns (gfn_t is uint64)
+				  + 2 * prefetch_count  // copysets (copyset_t is uint16)
+				  + 4 * prefetch_count  // versions (version_t is uint32)
+				  + 2 * prefetch_count; // Lengths of prefetched pages
+	for(iterator = 0; iterator < prefetch_count; iterator++) {
+		resp_length += prefetched_pages[iterator].length; // Data of prefetched pages
+	}
+
+	// Fill in response data
+	*resp_data_ptr = kmalloc(resp_length, GFP_KERNEL);
+	if (*resp_data_ptr == NULL) {
+		for (iterator = 0; iterator < KVM_PREFETCH_MAX_WINDOW_SIZE; iterator++) {
+			kfree(prefetched_pages[iterator].page);
+		}
+		return -ENOMEM;
+	}
+
+    memcpy(*resp_data_ptr, &prefetch_count, 1);
+	memcpy(*resp_data_ptr + 1, &target_length, 2);
+	memcpy(*resp_data_ptr + 3, target_page, target_length);
+	for(iterator = 0; iterator < prefetch_count; iterator++) {
+		temp = 0;
+		memcpy(*resp_data_ptr + 3 + target_length + iterator * 8, &(prefetched_pages[iterator].gfn), 8);
+		memcpy(*resp_data_ptr + 3 + target_length + prefetch_count * 8 + iterator * 2, &(prefetched_pages[iterator].copyset), 2);
+		memcpy(*resp_data_ptr + 3 + target_length + prefetch_count * 10 + iterator * 4, &(prefetched_pages[iterator].version), 4);
+		memcpy(*resp_data_ptr + 3 + target_length + prefetch_count * 14 + iterator * 2, &(prefetched_pages[iterator].length), 2);
+		memcpy(*resp_data_ptr + 3 + target_length + prefetch_count * 16 + temp, prefetched_pages[iterator].page, prefetched_pages[iterator].length);
+		temp += prefetched_pages[iterator].length;
+	}
+
+	for (iterator = 0; iterator < KVM_PREFETCH_MAX_WINDOW_SIZE; iterator++) {
+		kfree(prefetched_pages[iterator].page);
+	}
+	printk(KERN_DEBUG "handle_prefetch_req: before leaving me, resp_data is %p", *resp_data_ptr);
+	return resp_length;
+}
+
+void dump_compare_prefetch_resp(char *resp_data, char *target_page, int target_page_length) {
+	int prefetch_count = 0;
+	int iterator;
+	int temp;
+	int length;
+	gfn_t gfn;
+	copyset_t copyset;
+	version_t version;
+	int target_page_length_from_resp;
+	char *target_page_from_resp;
+	char *page;
+
+	target_page_from_resp = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	page = kmalloc(PAGE_SIZE, GFP_KERNEL);
+
+	printk(KERN_DEBUG "dump_compare_prefetch_resp: after allocating pages. target_page_from_resp = %p, page = %p", target_page_from_resp, page);
+	printk(KERN_DEBUG "dump_compare_prefetch_resp: target_page = %p, target_page_length = %d, resp_data = %p", target_page, target_page_length, resp_data);
+
+	// memcpy(&prefetch_count, resp_data, 1);
+	// memcpy(&target_page_length_from_resp, resp_data + 1, 2);
+	// memcpy(target_page_from_resp, resp_data + 3, target_page_length_from_resp);
+	// printk(KERN_DEBUG "prefetch_count: %d, target_page_length: %d, target_page_length_from_resp: %d", prefetch_count, target_page_length, target_page_length_from_resp);
+	// printk(KERN_DEBUG "target page diff: %d", memcmp(target_page, target_page_from_resp, target_page_length));
+	// for(iterator = 0; iterator < prefetch_count; iterator++) {
+	// 	temp = 0;
+	// 	memcpy(&gfn, resp_data + 3 + target_page_length_from_resp + iterator * 8, 8);
+	// 	memcpy(&copyset, resp_data + 3 + target_page_length_from_resp + prefetch_count * 8 + iterator * 2, 2);
+	// 	memcpy(&version, resp_data + 3 + target_page_length_from_resp + prefetch_count * 10 + iterator * 4, 4);
+	// 	memcpy(&length, resp_data + 3 + target_page_length_from_resp + prefetch_count * 14 + iterator * 2, 2);
+	// 	memcpy(page, resp_data + 3 + target_page_length_from_resp + prefetch_count * 16 + temp, length);
+	// 	temp += length;
+	// 	printk(KERN_DEBUG "gfn: %llu, copyset: %lu, version: %u, length: %d", gfn, copyset, version, length);
+	// }
+	kfree(target_page_from_resp);
+	kfree(page);
+}
+
 static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 		struct kvm_memory_slot *memslot, struct kvm_dsm_memory_slot *slot,
 		const struct dsm_request *req, bool *retry, hfn_t vfn, char *page,
@@ -354,6 +510,8 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 	struct dsm_response resp = {
 		.version = 0,
 	};
+	char *resp_data = NULL;
+	int resp_length;
 
 	if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
 		*retry = true;
@@ -424,7 +582,17 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 
 	tx_add->inv_copyset = resp.inv_copyset;
 	tx_add->version = resp.version;
+	printk(KERN_DEBUG "dsm_handle_read_req: Before handle_prefetch_req");
+	ret = handle_prefetch_req(kvm, req, page, length, &resp_data);
+	printk(KERN_DEBUG "dsm_handle_read_req: After handle_prefetch_req, ret = %d", ret);
+	if (ret < 0)
+		 goto out;
+	// ret = network_ops.send(conn_sock, resp_data, ret, 0, tx_add);
+	printk(KERN_DEBUG "dsm_handle_read_req: Before dump_compare_prefetch_resp, resp_data = %p", resp_data);
+	dump_compare_prefetch_resp(resp_data, page, length);
+	printk(KERN_DEBUG "dsm_handle_read_req: After dump_compare_prefetch_resp");
 	ret = network_ops.send(conn_sock, page, length, 0, tx_add);
+	kfree(resp_data); // Free data no matter what return value is
 	if (ret < 0)
 		goto out;
 	dsm_debug_v("kvm[%d] sent page[%llu,%d] to kvm[%d] length %d hash: 0x%x\n",
@@ -480,9 +648,6 @@ int ivy_kvm_dsm_handle_req(void *data)
 		BUG_ON(req.requester == kvm->arch.dsm_id);
 
 retry_handle_req:
-		if(req.prefetch_size > 0) {
-			printk(KERN_DEBUG "receiver: kvm_id: %d, prefetch_size: %d", kvm->arch.dsm_id, req.prefetch_size);
-		}
 		idx = srcu_read_lock(&kvm->srcu);
 		memslot = __gfn_to_memslot(__kvm_memslots(kvm, req.is_smm), req.gfn);
 		/*
@@ -752,9 +917,11 @@ int get_prefetch_window_size(struct kvm *kvm, gfn_t gfn)
 	return window_size;
 }
 
-void write_prefetch_to_req(struct kvm *kvm, gfn_t gfn, struct dsm_request *req)
+void write_prefetch_to_req(struct kvm *kvm, struct kvm_memory_slot *memslot, gfn_t gfn, struct dsm_request *req)
 {
-	int temp;
+	int iterator;
+	hfn_t vfn;
+	struct kvm_dsm_memory_slot *slot;
 	int window_size = get_prefetch_window_size(kvm, gfn);
 	int majority = find_trend(kvm);
 	if (window_size != 0)
@@ -762,9 +929,12 @@ void write_prefetch_to_req(struct kvm *kvm, gfn_t gfn, struct dsm_request *req)
 		if (majority != 0)
 		{
 			req->prefetch_size = window_size;
-			for (temp = 0; temp < window_size; temp++)
+			for (iterator = 0; iterator < window_size; iterator++)
 			{
-				req->prefetch_gfns[temp] = gfn + (temp + 1) * majority;
+				req->prefetch_gfns[iterator] = gfn + (iterator + 1) * majority;
+				vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
+				slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
+				req->prefetch_versions[iterator] = dsm_get_version(slot, vfn);
 			}
 		}
 		else
@@ -776,9 +946,12 @@ void write_prefetch_to_req(struct kvm *kvm, gfn_t gfn, struct dsm_request *req)
 			else
 			{
 				req->prefetch_size = window_size;
-				for (temp = 0; temp < window_size; temp++)
+				for (iterator = 0; iterator < window_size; iterator++)
 				{
-					req->prefetch_gfns[temp] = gfn + (temp + 1) * kvm->prefetch_last_trend;
+					req->prefetch_gfns[iterator] = gfn + (iterator + 1) * kvm->prefetch_last_trend;
+					vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
+					slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
+					req->prefetch_versions[iterator] = dsm_get_version(slot, vfn);
 				}
 			}
 		}
@@ -788,24 +961,21 @@ void write_prefetch_to_req(struct kvm *kvm, gfn_t gfn, struct dsm_request *req)
 		req->prefetch_size = 0;
 	}
 	kvm->prefetch_last_trend = majority;
-	if(req->prefetch_size != 0) {
-		printk(KERN_DEBUG "sender: kvm_id: %d, prefetch_size: %d", kvm->arch.dsm_id, req->prefetch_size);
-	}
 }
 
 void do_prefetch_demo(struct kvm *kvm, gfn_t gfn)
 {
-	int temp;
+	int iterator;
 	int window_size = get_prefetch_window_size(kvm, gfn);
 	int majority = find_trend(kvm);
 	if(window_size != 0) {
 		if(majority != 0) {
-			for(temp = 0; temp < window_size; temp++) {
-				kvm->prefetch_cache_demo[temp] = gfn + (temp + 1) * majority;
+			for(iterator = 0; iterator < window_size; iterator++) {
+				kvm->prefetch_cache_demo[iterator] = gfn + (iterator + 1) * majority;
 			}
 		} else {
-			for(temp = 0; temp < window_size; temp++) {
-				kvm->prefetch_cache_demo[temp] = gfn + (temp + 1) * kvm->prefetch_last_trend;
+			for(iterator = 0; iterator < window_size; iterator++) {
+				kvm->prefetch_cache_demo[iterator] = gfn + (iterator + 1) * kvm->prefetch_last_trend;
 			}
 		}
 	}
@@ -909,13 +1079,19 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 				ret = ACC_ALL;
 				goto out;
 			}
-			kvm->prefetch_stat_total++;
-			record_gfn_to_access_history(kvm, gfn, 1);
-			if(cache_demo(kvm, gfn)) {
-				printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
-			} else {
-				do_prefetch_demo(kvm, gfn);
-				write_prefetch_to_req(kvm, gfn, &req);
+			if (!is_smm)
+			{
+				kvm->prefetch_stat_total++;
+				record_gfn_to_access_history(kvm, gfn, 1);
+				if (cache_demo(kvm, gfn))
+				{
+					printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
+				}
+				else
+				{
+					do_prefetch_demo(kvm, gfn);
+					write_prefetch_to_req(kvm, memslot, gfn, &req);
+				}
 			}
 			/*
 			 * Ask the probOwner. The prob(ably) owner is probably true owner,
@@ -976,13 +1152,21 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			ret = ACC_EXEC_MASK | ACC_USER_MASK;
 			goto out;
 		}
-		kvm->prefetch_stat_total++;
-		record_gfn_to_access_history(kvm, gfn, 1);
-		if(cache_demo(kvm, gfn)) {
-			printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
-		} else {
-			do_prefetch_demo(kvm, gfn);
+		if (!is_smm)
+		{
+			kvm->prefetch_stat_total++;
+			record_gfn_to_access_history(kvm, gfn, 1);
+			if (cache_demo(kvm, gfn))
+			{
+				printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
+			}
+			else
+			{
+				do_prefetch_demo(kvm, gfn);
+				write_prefetch_to_req(kvm, memslot, gfn, &req);
+			}
 		}
+
 		/* Ask the probOwner */
 		ret = resp_len = kvm_dsm_fetch(kvm, owner, false, &req, page, &resp);
 		if (ret < 0)
