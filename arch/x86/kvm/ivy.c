@@ -1224,6 +1224,8 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	int resp_length = 0;
 	struct dsm_response resp;
 	int owner;
+	copyset_t copyset;
+	version_t version;
 
 	ret = 0;
 	vfn = __gfn_to_vfn_memslot(memslot, gfn);
@@ -1288,20 +1290,34 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 				ret = ACC_ALL;
 				goto out;
 			}
-			if (!is_smm)
+		
+			// Prefetch related
+			kvm->prefetch_stat_total++;
+			record_gfn_to_access_history(kvm, gfn, 1);
+			if (read_prefetch_cache(kvm, gfn, &copyset, &version, page))
 			{
-				kvm->prefetch_stat_total++;
-				record_gfn_to_access_history(kvm, gfn, 1);
-				if (cache_demo(kvm, gfn))
-				{
-					printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
+				printk(KERN_DEBUG "dsm_id: %d, hit gfn: %llu, write", kvm->arch.dsm_id, gfn);
+				ret = kvm_dsm_invalidate(kvm, gfn, is_smm, slot, vfn, &copyset, owner);
+				if (ret < 0)
+					goto out_error;
+				dsm_set_version(slot, vfn, version + 1);
+				dsm_clear_copyset(slot, vfn);
+				dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
+				dsm_set_twin_conditionally(slot, vfn, page, memslot, gfn, dsm_is_owner(slot, vfn), version);
+				ret = __kvm_write_guest_page(memslot, gfn, page, 0, PAGE_SIZE);
+				if (ret < 0) {
+					goto out_error;
 				}
-				else
-				{
-					do_prefetch_demo(kvm, gfn);
-					write_prefetch_to_req(kvm, memslot, gfn, &req);
-				}
+				dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
+				dsm_change_state(slot, vfn, DSM_OWNER | DSM_MODIFIED);
+				ret = ACC_ALL;
+				goto out;
 			}
+			else
+			{
+				write_prefetch_to_req(kvm, memslot, gfn, &req);
+			}
+			
 			/*
 			 * Ask the probOwner. The prob(ably) owner is probably true owner,
 			 * or not. If not, forward the request to next probOwner until find
@@ -1365,19 +1381,28 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			ret = ACC_EXEC_MASK | ACC_USER_MASK;
 			goto out;
 		}
-		if (!is_smm)
+		
+		// Prefetch related
+		kvm->prefetch_stat_total++;
+		record_gfn_to_access_history(kvm, gfn, 1);
+		if (read_prefetch_cache(kvm, gfn, &copyset, &version, page))
 		{
-			kvm->prefetch_stat_total++;
-			record_gfn_to_access_history(kvm, gfn, 1);
-			if (cache_demo(kvm, gfn))
-			{
-				printk(KERN_DEBUG "dsm_id: %d, total: %d, prefetched: %d, hits: %d", kvm->arch.dsm_id, kvm->prefetch_stat_total, kvm->prefetch_stat_prefetched_pages, kvm->prefetch_stat_cache_hits);
+			printk(KERN_DEBUG "dsm_id: %d, hit gfn: %llu, write", kvm->arch.dsm_id, gfn);
+			dsm_set_version(slot, vfn, version);
+			memcpy(dsm_get_copyset(slot, vfn), &copyset, sizeof(copyset_t));
+			dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
+			ret = __kvm_write_guest_page(memslot, gfn, page, 0, PAGE_SIZE);
+			if (ret < 0) {
+				goto out_error;
 			}
-			else
-			{
-				do_prefetch_demo(kvm, gfn);
-				write_prefetch_to_req(kvm, memslot, gfn, &req);
-			}
+			dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
+			dsm_change_state(slot, vfn, DSM_OWNER | DSM_SHARED);
+			ret = ACC_EXEC_MASK | ACC_USER_MASK;
+			goto out;
+		}
+		else
+		{
+			write_prefetch_to_req(kvm, memslot, gfn, &req);
 		}
 
 		/* Ask the probOwner */
