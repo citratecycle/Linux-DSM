@@ -646,7 +646,6 @@ static struct kvm *kvm_create_vm(unsigned long type)
 	mutex_init(&kvm->prefetch_cache_lock);
 	for(i = 0; i < KVM_PREFETCH_MAX_WINDOW_SIZE; i++) {
 		kvm->prefetch_cache[i].page = NULL;
-		kvm->prefetch_cache[i].valid = 0;
 	}
 	atomic_set(&kvm->users_count, 1);
 	INIT_LIST_HEAD(&kvm->devices);
@@ -756,7 +755,6 @@ static void kvm_destroy_vm(struct kvm *kvm)
 	}
 	// Prefetch
 	for(i = 0; i < KVM_PREFETCH_MAX_WINDOW_SIZE; i++) {
-		kvm->prefetch_cache[i].valid = 0;
 		if(kvm->prefetch_cache[i].page != NULL) {
 			kfree(kvm->prefetch_cache[i].page);
 			kvm->prefetch_cache[i].page = NULL;

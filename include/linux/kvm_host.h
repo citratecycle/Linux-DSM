@@ -392,7 +392,6 @@ struct kvm_prefetch_cache_t {
 	copyset_t copyset;
 	version_t version;
 	char *page;
-	int valid;
 };
 #endif
 

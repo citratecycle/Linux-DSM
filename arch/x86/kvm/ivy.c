@@ -88,172 +88,10 @@ struct dsm_response {
 	uint16_t version;
 };
 
-/*
- * @msg_sender: the message may be delegated by manager (or other probOwners)
- * (kvm->arch.dsm_id) and real sender can be appointed here.
- * @inv_copyset: if req_type = DSM_REQ_WRITE, the requester becomes owner and has duty
- * to broadcast invalidate.
- * @return: the length of response
- */
-static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
-		const struct dsm_request *req, void *data, struct dsm_response *resp)
-{
-	kconnection_t **conn_sock;
-	int ret;
-	tx_add_t tx_add = {
-		.txid = generate_txid(kvm, dest_id),
-	};
-	int retry_cnt = 0;
+/*****************************
+ * Prefetch Functions Starts *
+ *****************************/
 
-	if (kvm->arch.dsm_stopped)
-		return -EINVAL;
-
-	if (!from_server)
-		conn_sock = &kvm->arch.dsm_conn_socks[dest_id];
-	else {
-		conn_sock = &kvm->arch.dsm_conn_socks[DSM_MAX_INSTANCES + dest_id];
-	}
-
-	/*
-	 * Mutiple vCPUs/servers may connect to a remote node simultaneously.
-	 */
-	if (*conn_sock == NULL) {
-		mutex_lock(&kvm->arch.conn_init_lock);
-		if (*conn_sock == NULL) {
-			ret = kvm_dsm_connect(kvm, dest_id, conn_sock);
-			if (ret < 0) {
-				mutex_unlock(&kvm->arch.conn_init_lock);
-				return ret;
-			}
-		}
-		mutex_unlock(&kvm->arch.conn_init_lock);
-	}
-
-	dsm_debug_v("kvm[%d] sent request[0x%x] to kvm[%d] req_type[%s] gfn[%llu,%d]",
-			kvm->arch.dsm_id, tx_add.txid, dest_id, req_desc[req->req_type],
-			req->gfn, req->is_smm);
-
-	ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct
-				dsm_request), 0, &tx_add);
-	if (ret < 0)
-		goto done;
-
-	retry_cnt = 0;
-	if (req->req_type == DSM_REQ_INVALIDATE) {
-		ret = network_ops.receive(*conn_sock, data, 0, &tx_add);
-	}
-	else {
-retry:
-		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, &tx_add);
-		if (ret == -EAGAIN) {
-			retry_cnt++;
-			if (retry_cnt > 100000) {
-				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
-						"kvm %d for too LONG",
-						__func__, kvm->arch.dsm_id, req->gfn, dest_id);
-				retry_cnt = 0;
-			}
-			goto retry;
-		}
-		resp->inv_copyset = tx_add.inv_copyset;
-		resp->version = tx_add.version;
-	}
-	if (ret < 0)
-		goto done;
-
-done:
-	return ret;
-}
-
-/*
- * kvm_dsm_invalidate - issued by owner of a page to invalidate all of its copies
- * @cpyset: given copyset. NULL means using its own copyset.
- */
-static int kvm_dsm_invalidate(struct kvm *kvm, gfn_t gfn, bool is_smm,
-		struct kvm_dsm_memory_slot *slot, hfn_t vfn, copyset_t *cpyset, int req)
-{
-	int holder;
-	int ret = 0;
-	char r = 1;
-	copyset_t *copyset;
-	struct dsm_response resp;
-
-	copyset = cpyset ? cpyset : dsm_get_copyset(slot, vfn);
-
-	/*
-	 * A given copyset has been properly tailored so that no redundant INVs will
-	 * be sent to invalid nodes (nodes in the call-chain).
-	 */
-	for_each_set_bit(holder, copyset, DSM_MAX_INSTANCES) {
-		struct dsm_request req = {
-			.req_type = DSM_REQ_INVALIDATE,
-			.requester = kvm->arch.dsm_id,
-			.msg_sender = kvm->arch.dsm_id,
-			.gfn = gfn,
-			.is_smm = is_smm,
-			.version = dsm_get_version(slot, vfn),
-		};
-		if (kvm->arch.dsm_id == holder)
-			continue;
-		/* Santiy check on copyset consistency. */
-		BUG_ON(holder >= kvm->arch.cluster_iplist_len);
-
-		ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
-		if (ret < 0)
-			return ret;
-	}
-
-	return 0;
-}
-
-static int dsm_handle_invalidate_req(struct kvm *kvm, kconnection_t *conn_sock,
-		struct kvm_memory_slot *memslot, struct kvm_dsm_memory_slot *slot,
-		const struct dsm_request *req, bool *retry, hfn_t vfn, char *page,
-		tx_add_t *tx_add)
-{
-	int ret = 0;
-	char r;
-
-	if (dsm_is_pinned(slot, vfn) && !kvm->arch.dsm_stopped) {
-		*retry = true;
-		dsm_debug("kvm[%d] REQ_INV blocked by pinned gfn[%llu,%d], sleep then retry\n",
-				kvm->arch.dsm_id, req->gfn, req->is_smm);
-		return 0;
-	}
-
-	/*
-	 * The vfn->gfn rmap can be inconsistent with kvm_memslots when
-	 * we're setting memslot, but this will not affect the correctness.
-	 * If the old memslot is deleted, then the sptes will be zapped
-	 * anyway, so nothing should be done with this case. On the other
-	 * hand, if the new memslot is inserted (freshly created or moved),
-	 * its sptes are yet to be constructed in tdp_page_fault, and that
-	 * is protected by dsm_lock and cannot happen concurrently with the
-	 * server side transaction, so the correct DSM state will be seen
-	 * in spte construction.
-	 *
-	 * For usual cases, order between these two operations (change DSM state and
-	 * modify page table right) counts. After spte is zapped, DSM software
-	 * should make sure that #PF handler read the correct DSM state.
-	 */
-	BUG_ON(dsm_is_modified(slot, vfn));
-
-	dsm_lock_fast_path(slot, vfn, true);
-
-	dsm_change_state(slot, vfn, DSM_INVALID);
-	kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
-	dsm_set_prob_owner(slot, vfn, req->msg_sender);
-	dsm_clear_copyset(slot, vfn);
-	ret = network_ops.send(conn_sock, &r, 1, 0, tx_add);
-
-	dsm_unlock_fast_path(slot, vfn, true);
-
-	return ret < 0 ? ret : 0;
-}
-
-/*
- * resp_data will be allocated inside this function, so kfree() is needed after calling this
-*/
 int handle_prefetch_req(struct kvm *kvm, const struct dsm_request *req, char *target_page, int target_length, char *resp_data)
 {
 	int iterator;
@@ -417,11 +255,8 @@ int handle_prefetch_resp(struct kvm *kvm, struct kvm_memory_slot *memslot, char 
 			= kvm->prefetch_cache[kvm->prefetch_cache_head].copyset
 			= kvm->prefetch_cache[kvm->prefetch_cache_head].version = 0;
 		length = 0;
-		BUG_ON((kvm->prefetch_cache[kvm->prefetch_cache_head].page == NULL)
-			!= (kvm->prefetch_cache[kvm->prefetch_cache_head].valid == 0));
-		if(!kvm->prefetch_cache[kvm->prefetch_cache_head].valid) {
+		if(!kvm->prefetch_cache[kvm->prefetch_cache_head].page) {
 			kvm->prefetch_cache[kvm->prefetch_cache_head].page = kmalloc(PAGE_SIZE, GFP_KERNEL);
-			kvm->prefetch_cache[kvm->prefetch_cache_head].valid = 1;
 		}
 		memset(kvm->prefetch_cache[kvm->prefetch_cache_head].page, 0, PAGE_SIZE);
 		
@@ -435,7 +270,26 @@ int handle_prefetch_resp(struct kvm *kvm, struct kvm_memory_slot *memslot, char 
 
 		kvm->prefetch_cache_head = (kvm->prefetch_cache_head + 1) % KVM_PREFETCH_MAX_WINDOW_SIZE;
 	}
+	mutex_unlock(&kvm->prefetch_cache_lock);
 	return target_page_length;
+}
+
+int invalidate_prefetch_cache(struct kvm *kvm, gfn_t gfn) {
+	int iterator;
+	mutex_lock(&kvm->prefetch_cache_lock);
+	for(iterator = 0; iterator < KVM_PREFETCH_MAX_WINDOW_SIZE; iterator++) {
+		if(kvm->prefetch_cache[iterator].gfn == gfn && kvm->prefetch_cache[iterator].page) {
+			kfree(kvm->prefetch_cache[iterator].page);
+			kvm->prefetch_cache[iterator].page = NULL;
+			kvm->prefetch_cache[kvm->prefetch_cache_head].gfn
+				= kvm->prefetch_cache[kvm->prefetch_cache_head].copyset
+				= kvm->prefetch_cache[kvm->prefetch_cache_head].version = 0;
+			mutex_unlock(&kvm->prefetch_cache_lock);
+			return 1;
+		}
+	}
+	mutex_unlock(&kvm->prefetch_cache_lock);
+	return 0;
 }
 
 void dump_compare_prefetch_resp(char *resp_data, char *target_page, int target_page_length) {
@@ -473,6 +327,365 @@ void dump_compare_prefetch_resp(char *resp_data, char *target_page, int target_p
 	}
 	kfree(target_page_from_resp);
 	kfree(page);
+}
+
+void record_gfn_to_access_history(struct kvm *kvm, gfn_t gfn, int write)
+{
+	mutex_lock(&kvm->prefetch_access_history_lock);
+	kvm->prefetch_access_history[kvm->prefetch_access_history_head].gfn_delta = gfn - kvm->prefetch_last_gfn;
+	kvm->prefetch_access_history[kvm->prefetch_access_history_head].write = write;
+	kvm->prefetch_last_gfn = gfn;
+	kvm->prefetch_access_history_head++;
+	if (kvm->prefetch_access_history_head >= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
+		kvm->prefetch_access_history_head -= KVM_PREFETCH_ACCESS_HISTORY_SIZE;
+	}
+	mutex_unlock(&kvm->prefetch_access_history_lock);
+}
+
+long long find_trend(struct kvm *kvm)
+{
+	int w = KVM_PREFETCH_ACCESS_HISTORY_SIZE / KVM_PREFETCH_TREND_WINDOW_SPLIT;
+	long long majority = 0;
+	int iterator, count, index;
+
+	mutex_lock(&kvm->prefetch_access_history_lock);
+	while(w <= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
+		// Boyer–Moore majority vote algorithm
+		count = 0;
+		for(iterator = 1; iterator <= w; iterator++) {
+			index = kvm->prefetch_access_history_head - iterator;
+			if(index < 0) {
+				index += KVM_PREFETCH_ACCESS_HISTORY_SIZE;
+			}
+			if(count == 0) {
+				majority = kvm->prefetch_access_history[index].gfn_delta;
+			} else if (majority == kvm->prefetch_access_history[index].gfn_delta) {
+				count++;
+			} else {
+				count--;
+			}
+		}
+		// Check whether the majority is a real majority
+		count = 0;
+		for(iterator = 1; iterator <= w; iterator++) {
+			index = kvm->prefetch_access_history_head - iterator;
+			if(index < 0) {
+				index += KVM_PREFETCH_ACCESS_HISTORY_SIZE;
+			}
+			if(majority == kvm->prefetch_access_history[index].gfn_delta) {
+				count++;
+			}
+		}
+		if(count < w / 2 + 1) {
+			majority = 0;
+		}
+		// Increase window size
+		w *= 2;
+		// Return majority
+		if(majority != 0) {
+			mutex_unlock(&kvm->prefetch_access_history_lock);
+			return majority;
+		}
+	}
+	mutex_unlock(&kvm->prefetch_access_history_lock);
+	return majority;
+}
+
+int get_prefetch_window_size(struct kvm *kvm, gfn_t gfn)
+{
+	int window_size = 0, temp;
+	if(kvm->prefetch_cache_hits == 0) {
+		temp = kvm->prefetch_access_history_head - 1;
+		temp = temp < 0 ? temp + KVM_PREFETCH_ACCESS_HISTORY_SIZE : temp;
+		if(kvm->prefetch_access_history[temp].gfn_delta == kvm->prefetch_last_trend) {
+			window_size = 1;
+		} else {
+			window_size = 0;
+		}
+	} else {
+		if(KVM_PREFETCH_MAX_WINDOW_SIZE <= 16) {
+			switch(kvm->prefetch_cache_hits + 1) {
+				case 2: window_size = 2; break;
+				case 3:
+				case 4:
+				case 5:
+				case 6:
+				case 7:
+				case 8: window_size = 8; break;
+				case 9:
+				case 10:
+				case 11:
+				case 12:
+				case 13:
+				case 14:
+				case 15:
+				case 16: window_size = 16; break;
+			}
+		} else {
+			temp = 0;
+			while(kvm->prefetch_cache_hits != 0) {
+				kvm->prefetch_cache_hits /= 2;
+				temp++;
+			}
+			window_size = 2;
+			while(temp > 1) {
+				window_size *= 2;
+				temp--;
+			}
+		}
+	}
+	window_size = window_size < KVM_PREFETCH_MAX_WINDOW_SIZE ? window_size : KVM_PREFETCH_MAX_WINDOW_SIZE;
+	if(window_size < kvm->prefetch_last_window_size / 2) {
+		window_size = kvm->prefetch_last_window_size / 2;
+	}
+	kvm->prefetch_cache_hits = 0;
+	kvm->prefetch_last_window_size = window_size;
+	kvm->prefetch_stat_prefetched_pages += window_size;
+	return window_size;
+}
+
+void write_prefetch_to_req(struct kvm *kvm, struct kvm_memory_slot *memslot, gfn_t gfn, struct dsm_request *req)
+{
+	int iterator;
+	hfn_t vfn;
+	struct kvm_dsm_memory_slot *slot;
+	int window_size = get_prefetch_window_size(kvm, gfn);
+	int majority = find_trend(kvm);
+	if (window_size != 0)
+	{
+		if (majority != 0)
+		{
+			req->prefetch_size = window_size;
+			for (iterator = 0; iterator < window_size; iterator++)
+			{
+				req->prefetch_gfns[iterator] = gfn + (iterator + 1) * majority;
+				vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
+				slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
+				req->prefetch_versions[iterator] = dsm_get_version(slot, vfn);
+			}
+		}
+		else
+		{
+			if (kvm->prefetch_last_trend == 0)
+			{
+				req->prefetch_size = 0;
+			}
+			else
+			{
+				req->prefetch_size = window_size;
+				for (iterator = 0; iterator < window_size; iterator++)
+				{
+					req->prefetch_gfns[iterator] = gfn + (iterator + 1) * kvm->prefetch_last_trend;
+					vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
+					slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
+					req->prefetch_versions[iterator] = dsm_get_version(slot, vfn);
+				}
+			}
+		}
+	}
+	else // window_size == 0
+	{
+		req->prefetch_size = 0;
+	}
+	kvm->prefetch_last_trend = majority;
+}
+
+void do_prefetch_demo(struct kvm *kvm, gfn_t gfn)
+{
+	int iterator;
+	int window_size = get_prefetch_window_size(kvm, gfn);
+	int majority = find_trend(kvm);
+	if(window_size != 0) {
+		if(majority != 0) {
+			for(iterator = 0; iterator < window_size; iterator++) {
+				kvm->prefetch_cache_demo[iterator] = gfn + (iterator + 1) * majority;
+			}
+		} else {
+			for(iterator = 0; iterator < window_size; iterator++) {
+				kvm->prefetch_cache_demo[iterator] = gfn + (iterator + 1) * kvm->prefetch_last_trend;
+			}
+		}
+	}
+	kvm->prefetch_last_trend = majority;
+}
+
+int cache_demo(struct kvm *kvm, gfn_t gfn) {
+	int i;
+	for(i = 0; i < kvm->prefetch_last_window_size; i++) {
+		if(gfn == kvm->prefetch_cache_demo[i]) {
+			kvm->prefetch_cache_hits++;
+			kvm->prefetch_stat_cache_hits++;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/***************************
+ * Prefetch Functions Ends *
+ ***************************/
+
+/*
+ * @msg_sender: the message may be delegated by manager (or other probOwners)
+ * (kvm->arch.dsm_id) and real sender can be appointed here.
+ * @inv_copyset: if req_type = DSM_REQ_WRITE, the requester becomes owner and has duty
+ * to broadcast invalidate.
+ * @return: the length of response
+ */
+static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
+		const struct dsm_request *req, void *data, struct dsm_response *resp)
+{
+	kconnection_t **conn_sock;
+	int ret;
+	tx_add_t tx_add = {
+		.txid = generate_txid(kvm, dest_id),
+	};
+	int retry_cnt = 0;
+
+	if (kvm->arch.dsm_stopped)
+		return -EINVAL;
+
+	if (!from_server)
+		conn_sock = &kvm->arch.dsm_conn_socks[dest_id];
+	else {
+		conn_sock = &kvm->arch.dsm_conn_socks[DSM_MAX_INSTANCES + dest_id];
+	}
+
+	/*
+	 * Mutiple vCPUs/servers may connect to a remote node simultaneously.
+	 */
+	if (*conn_sock == NULL) {
+		mutex_lock(&kvm->arch.conn_init_lock);
+		if (*conn_sock == NULL) {
+			ret = kvm_dsm_connect(kvm, dest_id, conn_sock);
+			if (ret < 0) {
+				mutex_unlock(&kvm->arch.conn_init_lock);
+				return ret;
+			}
+		}
+		mutex_unlock(&kvm->arch.conn_init_lock);
+	}
+
+	dsm_debug_v("kvm[%d] sent request[0x%x] to kvm[%d] req_type[%s] gfn[%llu,%d]",
+			kvm->arch.dsm_id, tx_add.txid, dest_id, req_desc[req->req_type],
+			req->gfn, req->is_smm);
+
+	ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct
+				dsm_request), 0, &tx_add);
+	if (ret < 0)
+		goto done;
+
+	retry_cnt = 0;
+	if (req->req_type == DSM_REQ_INVALIDATE) {
+		ret = network_ops.receive(*conn_sock, data, 0, &tx_add);
+	}
+	else {
+retry:
+		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, &tx_add);
+		if (ret == -EAGAIN) {
+			retry_cnt++;
+			if (retry_cnt > 100000) {
+				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
+						"kvm %d for too LONG",
+						__func__, kvm->arch.dsm_id, req->gfn, dest_id);
+				retry_cnt = 0;
+			}
+			goto retry;
+		}
+		resp->inv_copyset = tx_add.inv_copyset;
+		resp->version = tx_add.version;
+	}
+	if (ret < 0)
+		goto done;
+
+done:
+	return ret;
+}
+
+/*
+ * kvm_dsm_invalidate - issued by owner of a page to invalidate all of its copies
+ * @cpyset: given copyset. NULL means using its own copyset.
+ */
+static int kvm_dsm_invalidate(struct kvm *kvm, gfn_t gfn, bool is_smm,
+		struct kvm_dsm_memory_slot *slot, hfn_t vfn, copyset_t *cpyset, int req)
+{
+	int holder;
+	int ret = 0;
+	char r = 1;
+	copyset_t *copyset;
+	struct dsm_response resp;
+
+	copyset = cpyset ? cpyset : dsm_get_copyset(slot, vfn);
+
+	/*
+	 * A given copyset has been properly tailored so that no redundant INVs will
+	 * be sent to invalid nodes (nodes in the call-chain).
+	 */
+	for_each_set_bit(holder, copyset, DSM_MAX_INSTANCES) {
+		struct dsm_request req = {
+			.req_type = DSM_REQ_INVALIDATE,
+			.requester = kvm->arch.dsm_id,
+			.msg_sender = kvm->arch.dsm_id,
+			.gfn = gfn,
+			.is_smm = is_smm,
+			.version = dsm_get_version(slot, vfn),
+		};
+		if (kvm->arch.dsm_id == holder)
+			continue;
+		/* Santiy check on copyset consistency. */
+		BUG_ON(holder >= kvm->arch.cluster_iplist_len);
+
+		ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int dsm_handle_invalidate_req(struct kvm *kvm, kconnection_t *conn_sock,
+		struct kvm_memory_slot *memslot, struct kvm_dsm_memory_slot *slot,
+		const struct dsm_request *req, bool *retry, hfn_t vfn, char *page,
+		tx_add_t *tx_add)
+{
+	int ret = 0;
+	char r;
+
+	if (dsm_is_pinned(slot, vfn) && !kvm->arch.dsm_stopped) {
+		*retry = true;
+		dsm_debug("kvm[%d] REQ_INV blocked by pinned gfn[%llu,%d], sleep then retry\n",
+				kvm->arch.dsm_id, req->gfn, req->is_smm);
+		return 0;
+	}
+
+	/*
+	 * The vfn->gfn rmap can be inconsistent with kvm_memslots when
+	 * we're setting memslot, but this will not affect the correctness.
+	 * If the old memslot is deleted, then the sptes will be zapped
+	 * anyway, so nothing should be done with this case. On the other
+	 * hand, if the new memslot is inserted (freshly created or moved),
+	 * its sptes are yet to be constructed in tdp_page_fault, and that
+	 * is protected by dsm_lock and cannot happen concurrently with the
+	 * server side transaction, so the correct DSM state will be seen
+	 * in spte construction.
+	 *
+	 * For usual cases, order between these two operations (change DSM state and
+	 * modify page table right) counts. After spte is zapped, DSM software
+	 * should make sure that #PF handler read the correct DSM state.
+	 */
+	BUG_ON(dsm_is_modified(slot, vfn));
+
+	dsm_lock_fast_path(slot, vfn, true);
+
+	dsm_change_state(slot, vfn, DSM_INVALID);
+	kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
+	dsm_set_prob_owner(slot, vfn, req->msg_sender);
+	dsm_clear_copyset(slot, vfn);
+	ret = network_ops.send(conn_sock, &r, 1, 0, tx_add);
+
+	dsm_unlock_fast_path(slot, vfn, true);
+
+	return ret < 0 ? ret : 0;
 }
 
 static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
@@ -941,198 +1154,6 @@ static bool is_fast_path(struct kvm *kvm, struct kvm_dsm_memory_slot *slot,
 		}
 	}
 	return false;
-}
-
-void record_gfn_to_access_history(struct kvm *kvm, gfn_t gfn, int write)
-{
-	mutex_lock(&kvm->prefetch_access_history_lock);
-	kvm->prefetch_access_history[kvm->prefetch_access_history_head].gfn_delta = gfn - kvm->prefetch_last_gfn;
-	kvm->prefetch_access_history[kvm->prefetch_access_history_head].write = write;
-	kvm->prefetch_last_gfn = gfn;
-	kvm->prefetch_access_history_head++;
-	if (kvm->prefetch_access_history_head >= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
-		kvm->prefetch_access_history_head -= KVM_PREFETCH_ACCESS_HISTORY_SIZE;
-	}
-	mutex_unlock(&kvm->prefetch_access_history_lock);
-}
-
-long long find_trend(struct kvm *kvm)
-{
-	int w = KVM_PREFETCH_ACCESS_HISTORY_SIZE / KVM_PREFETCH_TREND_WINDOW_SPLIT;
-	long long majority = 0;
-	int iterator, count, index;
-
-	mutex_lock(&kvm->prefetch_access_history_lock);
-	while(w <= KVM_PREFETCH_ACCESS_HISTORY_SIZE) {
-		// Boyer–Moore majority vote algorithm
-		count = 0;
-		for(iterator = 1; iterator <= w; iterator++) {
-			index = kvm->prefetch_access_history_head - iterator;
-			if(index < 0) {
-				index += KVM_PREFETCH_ACCESS_HISTORY_SIZE;
-			}
-			if(count == 0) {
-				majority = kvm->prefetch_access_history[index].gfn_delta;
-			} else if (majority == kvm->prefetch_access_history[index].gfn_delta) {
-				count++;
-			} else {
-				count--;
-			}
-		}
-		// Check whether the majority is a real majority
-		count = 0;
-		for(iterator = 1; iterator <= w; iterator++) {
-			index = kvm->prefetch_access_history_head - iterator;
-			if(index < 0) {
-				index += KVM_PREFETCH_ACCESS_HISTORY_SIZE;
-			}
-			if(majority == kvm->prefetch_access_history[index].gfn_delta) {
-				count++;
-			}
-		}
-		if(count < w / 2 + 1) {
-			majority = 0;
-		}
-		// Increase window size
-		w *= 2;
-		// Return majority
-		if(majority != 0) {
-			mutex_unlock(&kvm->prefetch_access_history_lock);
-			return majority;
-		}
-	}
-	mutex_unlock(&kvm->prefetch_access_history_lock);
-	return majority;
-}
-
-int get_prefetch_window_size(struct kvm *kvm, gfn_t gfn)
-{
-	int window_size = 0, temp;
-	if(kvm->prefetch_cache_hits == 0) {
-		temp = kvm->prefetch_access_history_head - 1;
-		temp = temp < 0 ? temp + KVM_PREFETCH_ACCESS_HISTORY_SIZE : temp;
-		if(kvm->prefetch_access_history[temp].gfn_delta == kvm->prefetch_last_trend) {
-			window_size = 1;
-		} else {
-			window_size = 0;
-		}
-	} else {
-		if(KVM_PREFETCH_MAX_WINDOW_SIZE <= 16) {
-			switch(kvm->prefetch_cache_hits + 1) {
-				case 2: window_size = 2; break;
-				case 3:
-				case 4:
-				case 5:
-				case 6:
-				case 7:
-				case 8: window_size = 8; break;
-				case 9:
-				case 10:
-				case 11:
-				case 12:
-				case 13:
-				case 14:
-				case 15:
-				case 16: window_size = 16; break;
-			}
-		} else {
-			temp = 0;
-			while(kvm->prefetch_cache_hits != 0) {
-				kvm->prefetch_cache_hits /= 2;
-				temp++;
-			}
-			window_size = 2;
-			while(temp > 1) {
-				window_size *= 2;
-				temp--;
-			}
-		}
-	}
-	window_size = window_size < KVM_PREFETCH_MAX_WINDOW_SIZE ? window_size : KVM_PREFETCH_MAX_WINDOW_SIZE;
-	if(window_size < kvm->prefetch_last_window_size / 2) {
-		window_size = kvm->prefetch_last_window_size / 2;
-	}
-	kvm->prefetch_cache_hits = 0;
-	kvm->prefetch_last_window_size = window_size;
-	kvm->prefetch_stat_prefetched_pages += window_size;
-	return window_size;
-}
-
-void write_prefetch_to_req(struct kvm *kvm, struct kvm_memory_slot *memslot, gfn_t gfn, struct dsm_request *req)
-{
-	int iterator;
-	hfn_t vfn;
-	struct kvm_dsm_memory_slot *slot;
-	int window_size = get_prefetch_window_size(kvm, gfn);
-	int majority = find_trend(kvm);
-	if (window_size != 0)
-	{
-		if (majority != 0)
-		{
-			req->prefetch_size = window_size;
-			for (iterator = 0; iterator < window_size; iterator++)
-			{
-				req->prefetch_gfns[iterator] = gfn + (iterator + 1) * majority;
-				vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
-				slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
-				req->prefetch_versions[iterator] = dsm_get_version(slot, vfn);
-			}
-		}
-		else
-		{
-			if (kvm->prefetch_last_trend == 0)
-			{
-				req->prefetch_size = 0;
-			}
-			else
-			{
-				req->prefetch_size = window_size;
-				for (iterator = 0; iterator < window_size; iterator++)
-				{
-					req->prefetch_gfns[iterator] = gfn + (iterator + 1) * kvm->prefetch_last_trend;
-					vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
-					slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
-					req->prefetch_versions[iterator] = dsm_get_version(slot, vfn);
-				}
-			}
-		}
-	}
-	else // window_size == 0
-	{
-		req->prefetch_size = 0;
-	}
-	kvm->prefetch_last_trend = majority;
-}
-
-void do_prefetch_demo(struct kvm *kvm, gfn_t gfn)
-{
-	int iterator;
-	int window_size = get_prefetch_window_size(kvm, gfn);
-	int majority = find_trend(kvm);
-	if(window_size != 0) {
-		if(majority != 0) {
-			for(iterator = 0; iterator < window_size; iterator++) {
-				kvm->prefetch_cache_demo[iterator] = gfn + (iterator + 1) * majority;
-			}
-		} else {
-			for(iterator = 0; iterator < window_size; iterator++) {
-				kvm->prefetch_cache_demo[iterator] = gfn + (iterator + 1) * kvm->prefetch_last_trend;
-			}
-		}
-	}
-	kvm->prefetch_last_trend = majority;
-}
-
-int cache_demo(struct kvm *kvm, gfn_t gfn) {
-	int i;
-	for(i = 0; i < kvm->prefetch_last_window_size; i++) {
-		if(gfn == kvm->prefetch_cache_demo[i]) {
-			kvm->prefetch_cache_hits++;
-			kvm->prefetch_stat_cache_hits++;
-			return 1;
-		}
-	}
-	return 0;
 }
 
 /*
