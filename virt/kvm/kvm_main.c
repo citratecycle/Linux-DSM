@@ -641,7 +641,13 @@ static struct kvm *kvm_create_vm(unsigned long type)
 	mutex_init(&kvm->lock);
 	mutex_init(&kvm->irq_lock);
 	mutex_init(&kvm->slots_lock);
+	// Prefetch
 	mutex_init(&kvm->prefetch_access_history_lock);
+	mutex_init(&kvm->prefetch_cache_lock);
+	for(i = 0; i < KVM_PREFETCH_MAX_WINDOW_SIZE; i++) {
+		kvm->prefetch_cache[i].page = NULL;
+		kvm->prefetch_cache[i].valid = 0;
+	}
 	atomic_set(&kvm->users_count, 1);
 	INIT_LIST_HEAD(&kvm->devices);
 
@@ -747,6 +753,14 @@ static void kvm_destroy_vm(struct kvm *kvm)
 		if (kvm->buses[i])
 			kvm_io_bus_destroy(kvm->buses[i]);
 		kvm->buses[i] = NULL;
+	}
+	// Prefetch
+	for(i = 0; i < KVM_PREFETCH_MAX_WINDOW_SIZE; i++) {
+		kvm->prefetch_cache[i].valid = 0;
+		if(kvm->prefetch_cache[i].page != NULL) {
+			kfree(kvm->prefetch_cache[i].page);
+			kvm->prefetch_cache[i].page = NULL;
+		}
 	}
 	kvm_coalesced_mmio_free(kvm);
 #if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)

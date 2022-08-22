@@ -386,6 +386,14 @@ struct kvm_prefetch_access_history_t {
 	long long gfn_delta;
 	int write;
 };
+
+struct kvm_prefetch_cache_t {
+	gfn_t gfn;
+	copyset_t copyset;
+	version_t version;
+	char *page;
+	int valid;
+};
 #endif
 
 struct kvm {
@@ -457,6 +465,10 @@ struct kvm {
 	int prefetch_last_window_size;
 	int prefetch_cache_hits;
 	gfn_t prefetch_cache_demo[KVM_PREFETCH_MAX_WINDOW_SIZE];
+
+	struct mutex prefetch_cache_lock;
+	short prefetch_cache_head;
+	struct kvm_prefetch_cache_t prefetch_cache[KVM_PREFETCH_MAX_WINDOW_SIZE];
 
 	int prefetch_stat_total;
 	int prefetch_stat_prefetched_pages;
