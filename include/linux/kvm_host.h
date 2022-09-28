@@ -377,7 +377,7 @@ struct kvm_memslots {
 	atomic_t lru_slot;
 	int used_slots;
 };
-#if defined(CONFIG_KVM_DSM) && defined(IVY_KVM_DSM)
+#ifdef IVY_KVM_DSM_PREFETCH
 #define KVM_PREFETCH_ACCESS_HISTORY_SIZE 8
 #define KVM_PREFETCH_TREND_WINDOW_SPLIT 2
 #define KVM_PREFETCH_MAX_WINDOW_SIZE 8
@@ -392,6 +392,9 @@ struct kvm_prefetch_cache_t {
 	copyset_t copyset;
 	version_t version;
 	char *page;
+
+	struct kvm_prefetch_cache_t *prev;
+	struct kvm_prefetch_cache_t *next;
 };
 #endif
 
@@ -455,7 +458,7 @@ struct kvm {
 	struct dentry *debugfs_dentry;
 	struct kvm_stat_data **debugfs_stat_data;
 
-#if defined(CONFIG_KVM_DSM) && defined(IVY_KVM_DSM)
+#ifdef IVY_KVM_DSM_PREFETCH
 	struct mutex prefetch_access_history_lock;
 	gfn_t prefetch_last_gfn;
 	struct kvm_prefetch_access_history_t prefetch_access_history[KVM_PREFETCH_ACCESS_HISTORY_SIZE];
@@ -466,8 +469,7 @@ struct kvm {
 	gfn_t prefetch_cache_demo[KVM_PREFETCH_MAX_WINDOW_SIZE];
 
 	struct mutex prefetch_cache_lock;
-	short prefetch_cache_head;
-	struct kvm_prefetch_cache_t prefetch_cache[KVM_PREFETCH_MAX_WINDOW_SIZE];
+	struct kvm_prefetch_cache_t *prefetch_cache_head;
 
 	int prefetch_stat_total;
 	int prefetch_stat_prefetched_pages;

@@ -676,6 +676,10 @@ struct kvm_lpage_info {
 #define IVY_KVM_DSM
 //#define TARDIS_KVM_DSM
 
+#ifdef IVY_KVM_DSM
+#define IVY_KVM_DSM_PREFETCH
+#endif
+
 #ifdef KVM_DSM_DEBUG
 extern bool kvm_dsm_dbg_verbose;
 #endif

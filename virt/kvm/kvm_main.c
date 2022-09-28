@@ -641,12 +641,11 @@ static struct kvm *kvm_create_vm(unsigned long type)
 	mutex_init(&kvm->lock);
 	mutex_init(&kvm->irq_lock);
 	mutex_init(&kvm->slots_lock);
-	// Prefetch
+#ifdef IVY_KVM_DSM_PREFETCH
 	mutex_init(&kvm->prefetch_access_history_lock);
 	mutex_init(&kvm->prefetch_cache_lock);
-	for(i = 0; i < KVM_PREFETCH_MAX_WINDOW_SIZE; i++) {
-		kvm->prefetch_cache[i].page = NULL;
-	}
+	kvm->prefetch_cache_head = NULL;
+#endif
 	atomic_set(&kvm->users_count, 1);
 	INIT_LIST_HEAD(&kvm->devices);
 
@@ -741,6 +740,9 @@ static void kvm_destroy_vm(struct kvm *kvm)
 {
 	int i;
 	struct mm_struct *mm = kvm->mm;
+#ifdef IVY_KVM_DSM_PREFETCH
+	struct kvm_prefetch_cache_t *temp;
+#endif
 
 	kvm_destroy_vm_debugfs(kvm);
 	kvm_arch_sync_events(kvm);
@@ -753,13 +755,21 @@ static void kvm_destroy_vm(struct kvm *kvm)
 			kvm_io_bus_destroy(kvm->buses[i]);
 		kvm->buses[i] = NULL;
 	}
+#ifdef IVY_KVM_DSM_PREFETCH
 	// Prefetch
-	for(i = 0; i < KVM_PREFETCH_MAX_WINDOW_SIZE; i++) {
-		if(kvm->prefetch_cache[i].page != NULL) {
-			kfree(kvm->prefetch_cache[i].page);
-			kvm->prefetch_cache[i].page = NULL;
+	mutex_lock(&kvm->prefetch_cache_lock);
+	while(kvm->prefetch_cache_head) {
+		if(kvm->prefetch_cache_head->page) {
+			kfree(kvm->prefetch_cache_head->page);
+			kvm->prefetch_cache_head->page = NULL;
 		}
+		temp = kvm->prefetch_cache_head->next;
+		if(temp) temp->prev = NULL;
+		kfree(kvm->prefetch_cache_head);
+		kvm->prefetch_cache_head = temp;
 	}
+	mutex_unlock(&kvm->prefetch_cache_lock);
+#endif
 	kvm_coalesced_mmio_free(kvm);
 #if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
 	mmu_notifier_unregister(&kvm->mmu_notifier, kvm->mm);
