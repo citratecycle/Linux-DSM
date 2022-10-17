@@ -162,6 +162,9 @@ int insert_hvaslot(struct kvm_dsm_memslots *slots, int pos, hfn_t start,
 		unsigned long npages);
 
 void dsm_lock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn);
+#ifdef IVY_KVM_DSM_PREFETCH
+int dsm_trylock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn);
+#endif
 void dsm_unlock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn);
 
 static inline bool dsm_is_pinned(struct kvm_dsm_memory_slot *slot, hfn_t vfn)

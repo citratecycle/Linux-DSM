@@ -146,6 +146,13 @@ void dsm_lock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 #endif
 }
 
+#ifdef IVY_KVM_DSM_PREFETCH
+int dsm_trylock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn)
+{
+	return mutex_trylock(&slot->vfn_dsm_state[vfn - slot->base_vfn].lock);
+}
+#endif
+
 void dsm_unlock(struct kvm *kvm, struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
 	return mutex_unlock(&slot->vfn_dsm_state[vfn - slot->base_vfn].lock);

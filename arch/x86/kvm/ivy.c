@@ -88,6 +88,7 @@ struct dsm_response {
 	uint16_t version;
 };
 
+#ifdef IVY_KVM_DSM_PREFETCH
 /*****************************
  * Prefetch Functions Starts *
  *****************************/
@@ -147,22 +148,15 @@ int read_prefetch_cache(struct kvm *kvm, gfn_t gfn, copyset_t *copyset_ptr, vers
 void dump_prefetch_cache(struct kvm *kvm) {
 	struct kvm_prefetch_cache_t *temp;
 	mutex_lock(&kvm->prefetch_cache_lock);
-	printk(KERN_INFO "Prefetch Cache Dump: ");
-	temp = kvm->prefetch_cache_head;
-	while (temp) {
-		printk(KERN_INFO "gfn: %llx, page: %p, copyset: %lu, version: %u", temp->gfn, temp->page, temp->copyset, temp->version);
-		temp = temp->next;
+	if(kvm->prefetch_cache_head) {
+		printk(KERN_INFO "Prefetch Cache Dump of dsm_id %d: ", kvm->arch.dsm_id);
+		temp = kvm->prefetch_cache_head;
+		while (temp) {
+			printk(KERN_INFO "gfn: %llu, page: %p, copyset: %lx, version: %u", temp->gfn, temp->page, temp->copyset, temp->version);
+			temp = temp->next;
+		}
 	}
 	mutex_unlock(&kvm->prefetch_cache_lock);
-}
-
-void dump_linked_list(struct kvm_prefetch_cache_t *head) {
-	struct kvm_prefetch_cache_t *temp;
-	temp = head;
-	while (temp) {
-		printk(KERN_ALERT "temp: %p, temp->prev: %p, temp->next: %p", temp, temp->prev, temp->next);
-		temp = temp->next;
-	}
 }
 
 int handle_prefetch_req(struct kvm *kvm, const struct dsm_request *req, char *target_page, int target_length, char *resp_data)
@@ -215,26 +209,35 @@ int handle_prefetch_req(struct kvm *kvm, const struct dsm_request *req, char *ta
 		{
 			continue;
 		}
+		// ivy_kvm_dsm_handle_req, lock vfn
+		if (!dsm_trylock(kvm, slot, vfn))
+		{
+			continue;
+		}
 		// dsm_handle_read_req, identifying pinned gfn
 		if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped)
 		{
+			dsm_unlock(kvm, slot, vfn);
 			continue;
 		}
 		// dsm_handle_read_req, identifying ownership of gfn
 		if (!dsm_is_owner(slot, vfn))
 		{
+			dsm_unlock(kvm, slot, vfn);
 			continue;
 		}
 		// dsm_handle_read_req, read page
 		BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		// printk(KERN_INFO "handle_prefetch_req: dsm_id: %d, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->prefetch_gfns[iterator], vfn, req->msg_sender);
+		printk(KERN_INFO "handle_prefetch_req: dsm_id: %d, transmitting owner of gfn: %llu, vfn: %llu, to %d, change state to SHARED", kvm->arch.dsm_id, req->prefetch_gfns[iterator], vfn, req->msg_sender);
 		dsm_change_state(slot, vfn, DSM_SHARED);
 		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_SHARED);
 		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->prefetch_gfns[iterator], prefetched_pages[prefetch_count].page, 0, PAGE_SIZE);
 		if (ret < 0) {
+			dsm_unlock(kvm, slot, vfn);
 			continue;
 		}
+		dsm_unlock(kvm, slot, vfn);
 		prefetched_pages[prefetch_count].gfn = req->prefetch_gfns[iterator];
 		prefetched_pages[prefetch_count].copyset = *dsm_get_copyset(slot, vfn);
 		BUG_ON(!(test_bit(kvm->arch.dsm_id, &prefetched_pages[prefetch_count].copyset)));
@@ -313,18 +316,21 @@ void handle_prefetch_resp_owner_transmission(struct kvm *kvm, const struct dsm_r
 		{
 			continue;
 		}
+		dsm_lock(kvm, slot, vfn);
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		// printk(KERN_INFO "handle_prefetch_resp_owner_transmission: dsm_id: %d, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, gfn, vfn, req->msg_sender);
+		dsm_unlock(kvm, slot, vfn);
+		printk(KERN_INFO "handle_prefetch_resp_owner_transmission: dsm_id: %d, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, gfn, vfn, req->msg_sender);
 	}
 }
 
-int handle_prefetch_resp(struct kvm *kvm, struct kvm_memory_slot *memslot, char *target_page, char *resp_data) {
+int handle_prefetch_resp(struct kvm *kvm, struct kvm_memory_slot *memslot, char *target_page, char *resp_data, int prefetch_locked_vfns_num, hfn_t *prefetch_locked_vfns) {
 	int iterator;
 	int prefetch_count;
 	int target_page_length;
 	int temp;
 	int length;
 	struct kvm_prefetch_cache_t *seg_head = NULL, *seg_tail = NULL, *temp_node = NULL;
+	struct kvm_dsm_memory_slot *slot;
 
 	prefetch_count = target_page_length = 0;
 	memcpy(&prefetch_count, resp_data, 1);
@@ -361,13 +367,19 @@ int handle_prefetch_resp(struct kvm *kvm, struct kvm_memory_slot *memslot, char 
 		}
 	}
 	if (seg_head) {
-		
 		seg_tail->next = kvm->prefetch_cache_head;
 		if (kvm->prefetch_cache_head)
 			kvm->prefetch_cache_head->prev = seg_tail;
 		kvm->prefetch_cache_head = seg_head;
 	}
 	mutex_unlock(&kvm->prefetch_cache_lock);
+
+	printk(KERN_INFO "handle_prefetch_resp: dsm_id: %d, unlocking dsm:", kvm->arch.dsm_id);
+	for (iterator = 0; iterator < prefetch_locked_vfns_num; iterator++) {
+		slot = vfn_to_hvaslot(kvm, prefetch_locked_vfns[iterator]);
+		dsm_unlock(kvm, slot, prefetch_locked_vfns[iterator]);
+		printk(KERN_INFO "handle_prefetch_resp: dsm_id: %d, unlocked vfn: %llu", kvm->arch.dsm_id, prefetch_locked_vfns[iterator]);
+	}
 	return target_page_length;
 }
 
@@ -486,7 +498,7 @@ int get_prefetch_window_size(struct kvm *kvm, gfn_t gfn)
 	return window_size;
 }
 
-void write_prefetch_to_req(struct kvm *kvm, struct kvm_memory_slot *memslot, gfn_t gfn, struct dsm_request *req)
+void write_prefetch_to_req(struct kvm *kvm, struct kvm_memory_slot *memslot, gfn_t gfn, struct dsm_request *req, int *prefetch_locked_vfns_num, hfn_t *prefetch_locked_vfns)
 {
 	int iterator;
 	hfn_t vfn;
@@ -497,13 +509,21 @@ void write_prefetch_to_req(struct kvm *kvm, struct kvm_memory_slot *memslot, gfn
 	{
 		if (majority != 0)
 		{
-			req->prefetch_size = window_size;
+			req->prefetch_size = 0;
+			printk(KERN_INFO "write_prefetch_to_req: dsm_id: %d, locking dsm and put to request:", kvm->arch.dsm_id);
 			for (iterator = 0; iterator < window_size; iterator++)
 			{
+				vfn = __gfn_to_vfn_memslot(memslot, gfn + (iterator + 1) * majority);
+				slot = gfn_to_hvaslot(kvm, memslot, gfn + (iterator + 1) * majority);
+				if(!dsm_trylock(kvm, slot, vfn)) {
+					continue;
+				}
+				printk(KERN_INFO "dsm_id: %d, locking gfn: %llu, vfn: %llu", kvm->arch.dsm_id, gfn + (iterator + 1) * majority, vfn);
 				req->prefetch_gfns[iterator] = gfn + (iterator + 1) * majority;
-				vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
-				slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
 				req->prefetch_versions[iterator] = dsm_get_version(slot, vfn);
+				req->prefetch_size++;
+				prefetch_locked_vfns[*prefetch_locked_vfns_num] = vfn;
+				(*prefetch_locked_vfns_num)++;
 			}
 		}
 		else
@@ -514,13 +534,21 @@ void write_prefetch_to_req(struct kvm *kvm, struct kvm_memory_slot *memslot, gfn
 			}
 			else
 			{
-				req->prefetch_size = window_size;
+				req->prefetch_size = 0;
+				printk(KERN_INFO "write_prefetch_to_req: dsm_id: %d, target page: %llu, locking dsm and put to request:", kvm->arch.dsm_id, gfn);
 				for (iterator = 0; iterator < window_size; iterator++)
 				{
-					req->prefetch_gfns[iterator] = gfn + (iterator + 1) * kvm->prefetch_last_trend;
-					vfn = __gfn_to_vfn_memslot(memslot, req->prefetch_gfns[iterator]);
-					slot = gfn_to_hvaslot(kvm, memslot, req->prefetch_gfns[iterator]);
+					vfn = __gfn_to_vfn_memslot(memslot, gfn + (iterator + 1) * majority);
+					slot = gfn_to_hvaslot(kvm, memslot, gfn + (iterator + 1) * majority);
+					if(!dsm_trylock(kvm, slot, vfn)) {
+						continue;
+					}
+					printk(KERN_INFO "write_prefetch_to_req: dsm_id: %d, locking gfn: %llu, vfn: %llu", req->prefetch_gfns[iterator], kvm->arch.dsm_id, gfn + (iterator + 1) * majority, vfn);
+					req->prefetch_gfns[iterator] = gfn + (iterator + 1) * majority;
 					req->prefetch_versions[iterator] = dsm_get_version(slot, vfn);
+					req->prefetch_size++;
+					prefetch_locked_vfns[*prefetch_locked_vfns_num] = vfn;
+					(*prefetch_locked_vfns_num)++;
 				}
 			}
 		}
@@ -566,6 +594,7 @@ int cache_demo(struct kvm *kvm, gfn_t gfn) {
 /***************************
  * Prefetch Functions Ends *
  ***************************/
+#endif
 
 /*
  * @msg_sender: the message may be delegated by manager (or other probOwners)
@@ -696,10 +725,13 @@ static int dsm_handle_invalidate_req(struct kvm *kvm, kconnection_t *conn_sock,
 	// Invalidate page inside prefetch cache
 	if (invalidate_prefetch_cache(kvm, req->gfn)) {
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		// printk(KERN_INFO "dsm_handle_invalidate_req: dsm_id: %d, invalidating and transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
+		printk(KERN_INFO "dsm_handle_invalidate_req: dsm_id: %d, cache hit, invalidating and transmitting owner of gfn: %llu, vfn: %llu, to %d, dumping", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
+		dump_prefetch_cache(kvm);
 		ret = network_ops.send(conn_sock, &r, 1, 0, tx_add);
 		return ret;
 	}
+	printk(KERN_INFO "dsm_handle_invalidate_req: dsm_id: %d, fail to invalidate gfn: %llu, vfn: %llu, in cache, dumping:", kvm->arch.dsm_id, req->gfn, vfn);
+	dump_prefetch_cache(kvm);
 
 	if (dsm_is_pinned(slot, vfn) && !kvm->arch.dsm_stopped) {
 		*retry = true;
@@ -723,10 +755,14 @@ static int dsm_handle_invalidate_req(struct kvm *kvm, kconnection_t *conn_sock,
 	 * modify page table right) counts. After spte is zapped, DSM software
 	 * should make sure that #PF handler read the correct DSM state.
 	 */
+	if(dsm_is_modified(slot, vfn)) {
+		printk(KERN_INFO "dsm_handle_invalidate_req: dsm_id: %d, page modified. gfn: %llu, vfn: %llu", kvm->arch.dsm_id, req->gfn, vfn);
+	}
 	BUG_ON(dsm_is_modified(slot, vfn));
 
 	dsm_lock_fast_path(slot, vfn, true);
 
+	printk(KERN_INFO "dsm_handle_invalidate_req: dsm_id: %d, gfn: %llu, vfn: %llu change state to INVALID", kvm->arch.dsm_id, req->gfn, vfn);
 	dsm_change_state(slot, vfn, DSM_INVALID);
 	kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
 	dsm_set_prob_owner(slot, vfn, req->msg_sender);
@@ -759,7 +795,7 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 	}
 
 	if(read_prefetch_cache(kvm, req->gfn, &copyset, &version, page)) {
-		// printk(KERN_INFO "dsm_handle_write_req: dsm_id: %d, hit cache, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
+		printk(KERN_INFO "dsm_handle_write_req: dsm_id: %d, hit cache, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
 		clear_bit(kvm->arch.dsm_id, &copyset);
 		length = PAGE_SIZE;
@@ -776,6 +812,8 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 			return ret;
 		return 0;
 	}
+	printk(KERN_INFO "dsm_handle_write_req: dsm_id: %d, gfn: %llu, vfn: %llu, cache miss, dumping:", kvm->arch.dsm_id, req->gfn, vfn);
+	dump_prefetch_cache(kvm);
 
 	if (dsm_is_pinned(slot, vfn) && !kvm->arch.dsm_stopped) {
 		*retry = true;
@@ -792,6 +830,7 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 		dsm_debug_v("kvm[%d](M1) changed owner of gfn[%llu,%d] "
 				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
 				req->is_smm, kvm->arch.dsm_id, req->msg_sender);
+		printk(KERN_INFO "dsm_handle_write_req: dsm_id: %d, I'm owner. gfn: %llu, vfn: %llu change state to INVALID", kvm->arch.dsm_id, req->gfn, vfn);
 		dsm_change_state(slot, vfn, DSM_INVALID);
 		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
 		/* Send back copyset to new owner. */
@@ -824,6 +863,7 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 			return ret;
 		}
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
+		printk(KERN_INFO "dsm_handle_write_req: dsm_id: %d Initialize page. gfn: %llu, vfn: %llu change state to INVALID", kvm->arch.dsm_id, req->gfn, vfn);
 		dsm_change_state(slot, vfn, DSM_INVALID);
 
         // Prefetch
@@ -848,7 +888,7 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 			new_req.prefetch_gfns[iterator] = req->prefetch_gfns[iterator];
 			new_req.prefetch_versions[iterator] = req->prefetch_versions[iterator];
 		}
-		// printk(KERN_INFO "dsm_handle_write_req: forwarding. dsm_id: %d, gfn: %llu, vfn: %llu, prob_owner: %d", kvm->arch.dsm_id, req->gfn, vfn, dsm_get_prob_owner(slot, vfn));
+		printk(KERN_INFO "dsm_handle_write_req: forwarding. dsm_id: %d, gfn: %llu, vfn: %llu, prob_owner: %d", kvm->arch.dsm_id, req->gfn, vfn, dsm_get_prob_owner(slot, vfn));
 		owner = dsm_get_prob_owner(slot, vfn);
 		ret = resp_length = kvm_dsm_fetch(kvm, owner, true, &new_req, resp_data, &resp);
 		if (ret < 0) {
@@ -858,7 +898,7 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 
 		dsm_change_state(slot, vfn, DSM_INVALID);
 		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
-		// printk(KERN_INFO "dsm_handle_write_req: dsm_id: %d, after forwarding, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
+		printk(KERN_INFO "dsm_handle_write_req: dsm_id: %d, after forwarding, transmitting owner of gfn: %llu, vfn: %llu, to %d, change state to INVALID", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
 		dsm_debug_v("kvm[%d](M3) changed owner of gfn[%llu,%d] "
 				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
@@ -922,7 +962,7 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 	}
 
 	if (read_prefetch_cache(kvm, req->gfn, &copyset, &version, page)) {
-		// printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d, hit cache, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
+		printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d, hit cache, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
 		clear_bit(kvm->arch.dsm_id, &copyset);
 		length = PAGE_SIZE;
@@ -940,6 +980,8 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 			return ret;
 		return 0;
 	}
+	printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d, gfn: %llu, vfn: %llu, cache miss, dumping:", kvm->arch.dsm_id, req->gfn, vfn);
+	dump_prefetch_cache(kvm);
 
 	if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
 		*retry = true;
@@ -956,6 +998,7 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
 				req->is_smm, kvm->arch.dsm_id, req->msg_sender);
 		/* TODO: if modified */
+		printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d I'm the owner. gfn: %llu, vfn: %llu change state to SHARED", kvm->arch.dsm_id, req->gfn, vfn);
 		dsm_change_state(slot, vfn, DSM_SHARED);
 		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_SHARED);
 
@@ -991,6 +1034,7 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 		}
 
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
+		printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d Initialize page. gfn: %llu, vfn: %llu change state to SHARED", kvm->arch.dsm_id, req->gfn, vfn);
 		dsm_change_state(slot, vfn, DSM_SHARED);
 		dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
 		resp.inv_copyset = *dsm_get_copyset(slot, vfn);
@@ -1018,7 +1062,7 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 			new_req.prefetch_gfns[iterator] = req->prefetch_gfns[iterator];
 			new_req.prefetch_versions[iterator] = req->prefetch_versions[iterator];
 		}
-		// printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d, gfn: %llu, vfn: %llu, prob_owner: %d", kvm->arch.dsm_id, req->gfn, vfn, dsm_get_prob_owner(slot, vfn));
+		printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d, gfn: %llu, vfn: %llu, prob_owner: %d", kvm->arch.dsm_id, req->gfn, vfn, dsm_get_prob_owner(slot, vfn));
 		owner = dsm_get_prob_owner(slot, vfn);
 		ret = resp_length = kvm_dsm_fetch(kvm, owner, true, &new_req, resp_data, &resp);
 		if (ret < 0) {
@@ -1029,7 +1073,7 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 						&resp.inv_copyset)));
 		/* Even read fault changes owner now. May the force be with you. */
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		// printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d, after forwarding, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
+		printk(KERN_INFO "dsm_handle_read_req: dsm_id: %d, after forwarding, transmitting owner of gfn: %llu, vfn: %llu, to %d", kvm->arch.dsm_id, req->gfn, vfn, req->msg_sender);
 
 		// Prefetch
 		handle_prefetch_resp_owner_transmission(kvm, req, resp_data);
@@ -1141,7 +1185,7 @@ retry_handle_req:
 		 * request and finds whether there's some more requests.
 		 */
 		if (req.req_type != DSM_REQ_INVALIDATE) {
-			// printk(KERN_INFO "ivy_kvm_dsm_handle_req: forwarding. dsm_id: %d, waiting for lock, vfn: %llu", kvm->arch.dsm_id, vfn);
+			printk(KERN_INFO "ivy_kvm_dsm_handle_req: dispatching. dsm_id: %d, waiting for lock, gfn: %llu, vfn: %llu", kvm->arch.dsm_id, req.gfn, vfn);
 			// dump_prefetch_cache(kvm);
 			dsm_lock(kvm, slot, vfn);
 		}
@@ -1281,6 +1325,8 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	hfn_t vfn;
 	char *page = NULL;
 	char *resp_data = NULL;
+	int prefetch_locked_vfns_num = 0;
+	hfn_t prefetch_locked_vfns[KVM_PREFETCH_MAX_WINDOW_SIZE];
 	int resp_length = 0;
 	struct dsm_response resp;
 	int owner;
@@ -1314,7 +1360,9 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		goto out_error;
 	}
 
-	// printk(KERN_INFO "ivy_kvm_dsm_page_fault: kvm id: %d, acquiring gfn: %llu, vfn: %llu, prob_owner: %d", kvm->arch.dsm_id, gfn, vfn, dsm_get_prob_owner(slot, vfn));
+	memset(prefetch_locked_vfns, 0, KVM_PREFETCH_MAX_WINDOW_SIZE * sizeof(hfn_t));
+
+	printk(KERN_INFO "ivy_kvm_dsm_page_fault: kvm id: %d, acquiring gfn: %llu, vfn: %llu, prob_owner: %d", kvm->arch.dsm_id, gfn, vfn, dsm_get_prob_owner(slot, vfn));
 
 	/*
 	 * If #PF is owner write fault, then issue invalidate by itself.
@@ -1347,6 +1395,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			/* Owner of all pages is 0 on init. */
 			if (unlikely(dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0)) {
 				dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
+				printk(KERN_INFO "ivy_kvm_dsm_page_fault: write PF, dsm_id: %d Initialize page. gfn: %llu, vfn: %llu change state to OWNER | MODIFIED", kvm->arch.dsm_id, gfn, vfn);
 				dsm_change_state(slot, vfn, DSM_OWNER | DSM_MODIFIED);
 				dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
 				ret = ACC_ALL;
@@ -1369,7 +1418,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 				if (ret < 0) {
 					goto out_error;
 				}
-				// printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, hit cache, transmitting owner of gfn: %llu, vfn: %llu, to myself", kvm->arch.dsm_id, gfn, vfn);
+				printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, hit cache, transmitting owner of gfn: %llu, vfn: %llu, to myself, change state to OWNER | MODIFIED", kvm->arch.dsm_id, gfn, vfn);
 				dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
 				dsm_change_state(slot, vfn, DSM_OWNER | DSM_MODIFIED);
 				ret = ACC_ALL;
@@ -1377,7 +1426,9 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			}
 			else
 			{
-				write_prefetch_to_req(kvm, memslot, gfn, &req);
+				printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, gfn: %llu, vfn: %llu, cache miss, dumping:", kvm->arch.dsm_id, gfn, vfn);
+				dump_prefetch_cache(kvm);
+				write_prefetch_to_req(kvm, memslot, gfn, &req, &prefetch_locked_vfns_num, prefetch_locked_vfns);
 			}
 			
 			/*
@@ -1392,7 +1443,10 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			ret = resp_length = kvm_dsm_fetch(kvm, owner, false, &req, resp_data, &resp);
 			if (ret < 0)
 				goto out_error;
-			target_page_length = handle_prefetch_resp(kvm, memslot, page, resp_data);
+			target_page_length = handle_prefetch_resp(kvm, memslot, page, resp_data, prefetch_locked_vfns_num, prefetch_locked_vfns);
+			printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, after handling write prefetch, dumping:", kvm->arch.dsm_id);
+			dump_prefetch_cache(kvm);
+			dump_prefetch_cache(kvm);
 			ret = kvm_dsm_invalidate(kvm, gfn, is_smm, slot, vfn,
 					&resp.inv_copyset, owner);
 			if (ret < 0)
@@ -1415,7 +1469,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			}
 		}
 
-		// printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, after fetching, transmitting owner of gfn: %llu, vfn: %llu, to myself", kvm->arch.dsm_id, gfn, vfn);
+		printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, after fetching, transmitting owner of gfn: %llu, vfn: %llu, to myself, change state to OWNER | MODIFIED", kvm->arch.dsm_id, gfn, vfn);
 		dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
 		dsm_change_state(slot, vfn, DSM_OWNER | DSM_MODIFIED);
 		ret = ACC_ALL;
@@ -1439,6 +1493,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		/* Owner of all pages is 0 on init. */
 		if (unlikely(dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0)) {
 			dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
+			printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d read PF, Initialize page. gfn: %llu, vfn: %llu change state to OWNER | SHARED", kvm->arch.dsm_id, gfn, vfn);
 			dsm_change_state(slot, vfn, DSM_OWNER | DSM_SHARED);
 			dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
 			ret = ACC_EXEC_MASK | ACC_USER_MASK;
@@ -1457,7 +1512,7 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 			if (ret < 0) {
 				goto out_error;
 			}
-			// printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, hit cache, transmitting owner of gfn: %llu, vfn: %llu, to myself", kvm->arch.dsm_id, gfn, vfn);
+			printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, hit cache, transmitting owner of gfn: %llu, vfn: %llu, to myself, change state to OWNER | SHARED", kvm->arch.dsm_id, gfn, vfn);
 			dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
 			dsm_change_state(slot, vfn, DSM_OWNER | DSM_SHARED);
 			ret = ACC_EXEC_MASK | ACC_USER_MASK;
@@ -1465,7 +1520,9 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		}
 		else
 		{
-			write_prefetch_to_req(kvm, memslot, gfn, &req);
+			printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, gfn: %llu, vfn: %llu, cache miss, dumping:", kvm->arch.dsm_id, gfn, vfn);
+			dump_prefetch_cache(kvm);
+			write_prefetch_to_req(kvm, memslot, gfn, &req, &prefetch_locked_vfns_num, prefetch_locked_vfns);
 		}
 
 		/* Ask the probOwner */
@@ -1475,7 +1532,9 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		ret = resp_length = kvm_dsm_fetch(kvm, owner, false, &req, resp_data, &resp);
 		if (ret < 0)
 			goto out_error;
-		target_page_length = handle_prefetch_resp(kvm, memslot, page, resp_data);
+		target_page_length = handle_prefetch_resp(kvm, memslot, page, resp_data, prefetch_locked_vfns_num, prefetch_locked_vfns);
+		printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, after handling read prefetch, dumping:", kvm->arch.dsm_id);
+		dump_prefetch_cache(kvm);
 
 		dsm_set_version(slot, vfn, resp.version);
 		memcpy(dsm_get_copyset(slot, vfn), &resp.inv_copyset, sizeof(copyset_t));
@@ -1487,13 +1546,14 @@ int ivy_kvm_dsm_page_fault(struct kvm *kvm, struct kvm_memory_slot *memslot,
 		if (ret < 0)
 			goto out_error;
 
-		// printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, after fetching, transmitting owner of gfn: %llu, vfn: %llu, to myself", kvm->arch.dsm_id, gfn, vfn);
+		printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d, after fetching, transmitting owner of gfn: %llu, vfn: %llu, to myself", kvm->arch.dsm_id, gfn, vfn);
 		dsm_set_prob_owner(slot, vfn, kvm->arch.dsm_id);
 		/*
 		 * The node becomes owner after read fault because of data locality,
 		 * i.e. a write fault may occur soon. It's not designed to avoid annoying
 		 * bugs, right? See comments of dsm_handle_read_req.
 		 */
+		printk(KERN_INFO "ivy_kvm_dsm_page_fault: dsm_id: %d read PF, after fetching. gfn: %llu, vfn: %llu change state to OWNER | SHARED", kvm->arch.dsm_id, gfn, vfn);
 		dsm_change_state(slot, vfn, DSM_OWNER | DSM_SHARED);
 		ret = ACC_EXEC_MASK | ACC_USER_MASK;
 	}
