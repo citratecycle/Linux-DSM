@@ -55,8 +55,11 @@ struct ktcp_cb
 	struct socket *socket;
 };
 
-// #define KTCP_BUFFER_SIZE (sizeof(struct ktcp_hdr) + PAGE_SIZE)
+#ifdef IVY_KVM_DSM_PREFETCH
 #define KTCP_BUFFER_SIZE (sizeof(struct ktcp_hdr) + (1 + 2 + PAGE_SIZE + (16 + PAGE_SIZE) * KVM_PREFETCH_MAX_WINDOW_SIZE))
+#else
+#define KTCP_BUFFER_SIZE (sizeof(struct ktcp_hdr) + PAGE_SIZE)
+#endif
 
 static int __ktcp_send(struct socket *sock, const char *buffer, size_t length,
 		unsigned long flags)
